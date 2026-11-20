@@ -5,6 +5,7 @@ COPY common-events common-events
 COPY order-service order-service
 COPY inventory-service inventory-service
 COPY payment-service payment-service
+COPY pipeline-tests pipeline-tests
 RUN mvn -B -ntp package -DskipTests
 ARG SERVICE
 RUN cp ${SERVICE}/target/${SERVICE}-0.1.0-SNAPSHOT.jar /app.jar

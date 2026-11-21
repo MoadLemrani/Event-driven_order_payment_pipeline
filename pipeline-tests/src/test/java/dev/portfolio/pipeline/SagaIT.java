@@ -445,6 +445,166 @@ class SagaIT {
             + id + "' AND status = 'SUCCEEDED'")).isEqualTo(1);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"order", "inventory", "payment"})
+    void retriesFourAttemptsThenDeadLettersAndReplaysOnlyFailedService(String name) throws Exception {
+        long stockBefore = count(INVENTORY_DB, "SELECT available FROM inventory_service.stock WHERE sku = 'DEMO-SKU'");
+        var db = serviceDatabase(name);
+        String schema = name + "_service";
+        String table = schema + switch (name) {
+            case "order" -> ".orders";
+            case "inventory" -> ".reservations";
+            default -> ".payments";
+        };
+        String operation = name.equals("order") ? "UPDATE" : "INSERT";
+        execute(db, "CREATE SEQUENCE " + schema + ".test_attempts");
+        for (int n = 1; n <= 4; n++) execute(db, "CREATE SEQUENCE " + schema + ".test_time_" + n);
+        execute(db, "CREATE FUNCTION " + schema + ".test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            + "DECLARE n bigint; BEGIN n := nextval('" + schema + ".test_attempts'); "
+            + "PERFORM setval('" + schema + ".test_time_' || n, (extract(epoch FROM clock_timestamp()) * 1000)::bigint); "
+            + "RAISE EXCEPTION 'phase5 outage'; END $$");
+        execute(db, "CREATE TRIGGER test_outage BEFORE " + operation + " ON " + table
+            + " FOR EACH ROW EXECUTE FUNCTION " + schema + ".test_fail()");
+        String id;
+        long deadLetterId;
+        String original;
+        long started = System.nanoTime();
+        try {
+            id = createOrder("DEMO-SKU", 1, "dlq-" + UUID.randomUUID());
+            await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+                assertThat(count(db, "SELECT count(*) FROM " + schema
+                    + ".dead_letters WHERE message_key = '" + id + "'")).isEqualTo(1));
+            assertThat(Duration.ofNanos(System.nanoTime() - started).toMillis()).isGreaterThanOrEqualTo(1750);
+            assertThat(count(db, "SELECT last_value FROM " + schema + ".test_attempts")).isEqualTo(4);
+            // PostgreSQL sequences survive rollback, recording actual delivery times despite the injected failure.
+            for (int n = 2; n <= 4; n++) {
+                long previous = count(db, "SELECT last_value FROM " + schema + ".test_time_" + (n - 1));
+                long current = count(db, "SELECT last_value FROM " + schema + ".test_time_" + n);
+                assertThat(current - previous).isGreaterThanOrEqualTo((250L << (n - 2)) - 5);
+            }
+            original = scalar(db, "SELECT envelope FROM " + schema + ".dead_letters WHERE message_key = '" + id + "'");
+            deadLetterId = count(db, "SELECT id FROM " + schema + ".dead_letters WHERE message_key = '" + id + "'");
+            String eventId = JSON.readTree(original).path("eventId").asText();
+            assertThat(count(db, "SELECT count(*) FROM " + schema + ".processed_events WHERE event_id = '" + eventId + "'"))
+                .isZero();
+            assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body()).path("status").asText())
+                .isEqualTo("CREATED");
+        } finally {
+            execute(db, "DROP TRIGGER test_outage ON " + table);
+            execute(db, "DROP FUNCTION " + schema + ".test_fail()");
+            execute(db, "DROP SEQUENCE " + schema + ".test_attempts");
+            for (int n = 1; n <= 4; n++) execute(db, "DROP SEQUENCE " + schema + ".test_time_" + n);
+        }
+        URI base = awaitReady(SERVICES.stream().filter(s -> s.name().equals(name)).findFirst().orElseThrow());
+        assertThat(get(base.resolve("/dead-letters")).body()).contains(Long.toString(deadLetterId));
+        for (int repeat = 0; repeat < 2; repeat++) {
+            var response = HTTP.send(HttpRequest.newBuilder(base.resolve("/dead-letters/" + deadLetterId + "/replay"))
+                .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(202);
+        }
+        await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+            assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body()).path("status").asText())
+                .isEqualTo("CONFIRMED"));
+        assertThat(count(db, "SELECT count(*) FROM " + schema + ".outbox_events WHERE destination = 'order-events."
+            + name + ".replay' AND message_key = '" + id + "'")).isEqualTo(1);
+        assertThat(scalar(db, "SELECT envelope FROM " + schema + ".outbox_events WHERE destination = 'order-events."
+            + name + ".replay' AND message_key = '" + id + "'")).isEqualTo(original);
+        String eventId = JSON.readTree(original).path("eventId").asText();
+        assertThat(count(db, "SELECT count(*) FROM " + schema + ".processed_events WHERE event_id = '" + eventId + "'"))
+            .isEqualTo(1);
+        assertOutboxCounts(id, 2, 1, 1);
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '" + id + "'"))
+            .isEqualTo(1);
+        assertThat(count(INVENTORY_DB, "SELECT available FROM inventory_service.stock WHERE sku = 'DEMO-SKU'"))
+            .isEqualTo(stockBefore - 1);
+        var missing = HTTP.send(HttpRequest.newBuilder(base.resolve("/dead-letters/9223372036854775807/replay"))
+            .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(missing.statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void malformedRecordIsQuarantinedAndFailedReplayCreatesANewDeadLetter() throws Exception {
+        String key = UUID.randomUUID().toString();
+        try (var producer = new KafkaProducer<String, String>(Map.of(
+                "bootstrap.servers", KAFKA.getBootstrapServers(), "acks", "all",
+                "key.serializer", StringSerializer.class, "value.serializer", StringSerializer.class))) {
+            producer.send(new ProducerRecord<>("order-events", key, "{invalid-json")).get(15, TimeUnit.SECONDS);
+        }
+        for (String name : List.of("order", "inventory", "payment")) {
+            var db = serviceDatabase(name);
+            await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+                assertThat(count(db, "SELECT count(*) FROM " + name + "_service.dead_letters WHERE message_key = '" + key + "'"))
+                    .isEqualTo(1));
+        }
+        long id = count(ORDER_DB, "SELECT id FROM order_service.dead_letters WHERE message_key = '" + key + "'");
+        var response = HTTP.send(HttpRequest.newBuilder(orderUrl.resolve("/dead-letters/" + id + "/replay"))
+            .POST(HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(202);
+        await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.dead_letters WHERE message_key = '" + key + "'"))
+                .isEqualTo(2));
+        assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.dead_letters WHERE message_key = '" + key + "'"))
+            .isEqualTo(1);
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.dead_letters WHERE message_key = '" + key + "'"))
+            .isEqualTo(1);
+    }
+
+    @Test
+    void transientDatabaseFailureRecoversWithinRetryBudgetWithoutDeadLetter() throws Exception {
+        execute(PAYMENT_DB, "CREATE SEQUENCE payment_service.test_transient_attempts");
+        execute(PAYMENT_DB, "CREATE FUNCTION payment_service.test_transient() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            + "BEGIN IF nextval('payment_service.test_transient_attempts') < 3 THEN "
+            + "RAISE EXCEPTION 'temporary outage'; END IF; RETURN NEW; END $$");
+        execute(PAYMENT_DB, "CREATE TRIGGER test_transient BEFORE INSERT ON payment_service.payments "
+            + "FOR EACH ROW EXECUTE FUNCTION payment_service.test_transient()");
+        try {
+            String id = createOrder("DEMO-SKU", 1, "transient-" + UUID.randomUUID());
+            await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+                assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body()).path("status").asText())
+                    .isEqualTo("CONFIRMED"));
+            assertThat(count(PAYMENT_DB, "SELECT last_value FROM payment_service.test_transient_attempts")).isEqualTo(3);
+            assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.dead_letters WHERE message_key = '" + id + "'"))
+                .isZero();
+            assertOutboxCounts(id, 2, 1, 1);
+        } finally {
+            execute(PAYMENT_DB, "DROP TRIGGER test_transient ON payment_service.payments");
+            execute(PAYMENT_DB, "DROP FUNCTION payment_service.test_transient()");
+            execute(PAYMENT_DB, "DROP SEQUENCE payment_service.test_transient_attempts");
+        }
+    }
+
+    @Test
+    void deadLetterStorageOutageKeepsRecordPendingWithoutRecursiveDlqPublication() throws Exception {
+        execute(ORDER_DB, "CREATE SEQUENCE order_service.test_sink_attempts");
+        execute(ORDER_DB, "CREATE FUNCTION order_service.test_sink() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            + "BEGIN PERFORM nextval('order_service.test_sink_attempts'); RAISE EXCEPTION 'sink outage'; END $$");
+        execute(ORDER_DB, "CREATE TRIGGER test_sink BEFORE INSERT ON order_service.dead_letters "
+            + "FOR EACH ROW EXECUTE FUNCTION order_service.test_sink()");
+        String key = UUID.randomUUID().toString();
+        try (var producer = new KafkaProducer<String, String>(Map.of(
+                "bootstrap.servers", KAFKA.getBootstrapServers(), "acks", "all",
+                "key.serializer", StringSerializer.class, "value.serializer", StringSerializer.class));
+             var admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            var sent = producer.send(new ProducerRecord<>("order-events.order.DLT", key, "broken"))
+                .get(15, TimeUnit.SECONDS);
+            await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+                assertThat(count(ORDER_DB, "SELECT last_value FROM order_service.test_sink_attempts")).isGreaterThanOrEqualTo(5));
+            var partition = new TopicPartition(sent.topic(), sent.partition());
+            long end = admin.listOffsets(Map.of(partition, org.apache.kafka.clients.admin.OffsetSpec.latest()))
+                .partitionResult(partition).get(10, TimeUnit.SECONDS).offset();
+            assertThat(end).isEqualTo(sent.offset() + 1);
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.dead_letters WHERE message_key = '" + key + "'"))
+                .isZero();
+        } finally {
+            execute(ORDER_DB, "DROP TRIGGER test_sink ON order_service.dead_letters");
+            execute(ORDER_DB, "DROP FUNCTION order_service.test_sink()");
+            execute(ORDER_DB, "DROP SEQUENCE order_service.test_sink_attempts");
+        }
+        await().atMost(Duration.ofSeconds(40)).untilAsserted(() ->
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.dead_letters WHERE message_key = '" + key + "'"))
+                .isEqualTo(1));
+    }
+
     private static void execute(PostgreSQLContainer<?> db, String sql) throws Exception {
         try (var connection = DriverManager.getConnection(db.getJdbcUrl(), db.getUsername(), db.getPassword());
              var statement = connection.createStatement()) {

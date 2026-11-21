@@ -23,7 +23,7 @@ public class OrderEventListener {
         this.service = service;
     }
 
-    @KafkaListener(topics = OrderEvents.TOPIC)
+    @KafkaListener(topics = {OrderEvents.TOPIC, KafkaConfiguration.REPLAY})
     public void onEvent(String message) throws JsonProcessingException {
         EventEnvelope<OrderData> event = json.readValue(message, EVENT_TYPE);
         if (!OrderEvents.INVENTORY_RESERVED.equals(event.eventType())) {

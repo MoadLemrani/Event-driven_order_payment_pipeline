@@ -1,6 +1,5 @@
 package dev.portfolio.order.messaging;
 
-import dev.portfolio.events.OrderEvents;
 import org.slf4j.MDC;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -33,14 +32,14 @@ public class OutboxPublisher {
             return;
         }
         var batch = jdbc.query("""
-            SELECT id, aggregate_id, correlation_id, envelope FROM order_service.outbox_events
+            SELECT id, CASE WHEN destination = 'order-events' THEN aggregate_id::text ELSE message_key END AS message_key, destination, correlation_id, envelope FROM order_service.outbox_events
             WHERE sent_at IS NULL ORDER BY id LIMIT 50 FOR UPDATE
-            """, (rs, row) -> new PendingEvent(rs.getLong("id"), rs.getString("aggregate_id"),
+            """, (rs, row) -> new PendingEvent(rs.getLong("id"), rs.getString("message_key"), rs.getString("destination"),
                 rs.getString("correlation_id"), rs.getString("envelope")));
         for (var event : batch) {
             try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
                 // Reuse the exact serialized envelope and eventId on every attempt.
-                kafka.send(OrderEvents.TOPIC, event.aggregateId(), event.envelope()).get(15, TimeUnit.SECONDS);
+                kafka.send(event.destination(), event.messageKey(), event.envelope()).get(15, TimeUnit.SECONDS);
                 jdbc.update("UPDATE order_service.outbox_events SET sent_at = CURRENT_TIMESTAMP WHERE id = ?",
                     event.id());
             } catch (InterruptedException ex) {
@@ -53,5 +52,5 @@ public class OutboxPublisher {
         }
     }
 
-    private record PendingEvent(long id, String aggregateId, String correlationId, String envelope) {}
+    private record PendingEvent(long id, String messageKey, String destination, String correlationId, String envelope) {}
 }

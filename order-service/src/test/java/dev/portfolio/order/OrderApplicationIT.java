@@ -44,12 +44,40 @@ class OrderApplicationIT {
     private final TestRestTemplate http;
     private final JdbcTemplate jdbc;
     private final OrderService service;
+    private final dev.portfolio.order.messaging.DeadLetterStore deadLetters;
 
     @Autowired
-    OrderApplicationIT(TestRestTemplate http, JdbcTemplate jdbc, OrderService service) {
+    OrderApplicationIT(TestRestTemplate http, JdbcTemplate jdbc, OrderService service,
+                       dev.portfolio.order.messaging.DeadLetterStore deadLetters) {
         this.http = http;
         this.jdbc = jdbc;
         this.service = service;
+        this.deadLetters = deadLetters;
+    }
+
+    @Test
+    void replayRequestAndOutboxRollBackTogetherAndDuplicateCaptureIsHarmless() {
+        var record = new org.apache.kafka.clients.consumer.ConsumerRecord<String, String>(
+            "order-events.order.DLT", 0, 9001L, "test-replay", "{invalid");
+        deadLetters.capture(record);
+        deadLetters.capture(record);
+        long id = jdbc.queryForObject("SELECT id FROM order_service.dead_letters WHERE record_offset = 9001", Long.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.dead_letters WHERE record_offset = 9001", Long.class))
+            .isEqualTo(1);
+        jdbc.execute("ALTER TABLE order_service.dead_letters ADD CONSTRAINT test_replay_block CHECK (replay_requested_at IS NULL)");
+        try {
+            assertThatThrownBy(() -> deadLetters.replay(id)).isInstanceOf(RuntimeException.class);
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE message_key = 'test-replay'", Long.class))
+                .isZero();
+        } finally {
+            jdbc.execute("ALTER TABLE order_service.dead_letters DROP CONSTRAINT test_replay_block");
+        }
+        deadLetters.replay(id);
+        deadLetters.replay(id);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE message_key = 'test-replay' AND sent_at IS NULL", Long.class))
+            .isEqualTo(1);
+        assertThat(http.getForEntity("/dead-letters?after=-1", String.class).getStatusCode().value()).isEqualTo(400);
+        assertThat(http.postForEntity("/dead-letters/0/replay", null, String.class).getStatusCode().value()).isEqualTo(400);
     }
 
     @Test

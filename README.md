@@ -1,6 +1,6 @@
 # Event-driven order/payment pipeline
 
-A Java backend portfolio project built in nine reviewable phases. **Current phase: 4 — transactional outbox and idempotent consumers.**
+A Java backend portfolio project built in nine reviewable phases. **Current phase: 5 — retries, dead letters, and durable replay.**
 Orders coordinate through Kafka: confirm successful orders, cancel inventory rejections, and release reserved stock when mock payments fail.
 
 ## Modules
@@ -135,6 +135,31 @@ ORDER_OUTBOX_PUBLISHER_ENABLED=true docker compose up -d --no-deps --force-recre
 
 Poll the saved order ID: the pending event is published and the order reaches `CONFIRMED` when payments succeed and stock is available. No second POST is needed.
 
+## Retries, dead letters, and replay (Phase 5)
+
+Each service retries a failed Kafka record three times after the first attempt, with exponential delays of **250 ms, 500 ms, and 1 second**. These are blocking retries: the consumer's assigned partitions wait briefly, preserving normal processing order without retry-topic infrastructure. Exception type changes do not restart the retry budget. Business declines still emit saga events; they do not enter the DLQ.
+
+After four failed attempts, the handler publishes the raw record to `order-events.<service>.DLT` (`order`, `inventory`, or `payment`). It waits for Kafka acknowledgement before allowing the failed input offset to advance. Failed DLT publication is retried rather than silently dropping the record. A separate listener persists the raw payload, key, error message, DLT topic/partition/offset, and timestamps in that service's `dead_letters` table. The DLT locator is unique, so redelivery of the same DLT record is harmless. A database outage in this listener keeps its offset pending; it never recursively publishes to its own DLQ. The broker-to-database handoff is at least once, so a crash during original recovery can still produce multiple DLT records for one event.
+
+All three services expose:
+
+- `GET /dead-letters?after=0`: up to 100 records ordered by ID; use the last ID as `after` for the next page. Includes raw envelope, error, and replay-request timestamp.
+- `POST /dead-letters/{id}/replay`: returns `202 Accepted`, or `404` if absent. Atomically enqueues a replay in the outbox and marks the request. Repeating this request for the same row does not enqueue again.
+
+Replay publishes to `order-events.<service>.replay`, consumed only by the failed service. It preserves the raw payload, original event ID, correlation ID, and Kafka key. Outbox publication IDs for replay are separate from the event IDs inside the unchanged envelope. Fix the underlying database/schema/code problem first: replay does not edit malformed events or bypass deduplication. A repeated failure creates a new DLT row with its own replay action. `replayRequestedAt` means queued, not successfully processed; use the order state and subsequent dead letters to determine the outcome. Replaying a record already processed is a safe no-op at the business layer.
+
+Example for payment-service (ports 8081 and 8082 expose the same API for order and inventory):
+
+```sh
+curl -s http://localhost:8083/dead-letters
+# Replace 1 with an ID returned above, after fixing the failure:
+curl -i -X POST http://localhost:8083/dead-letters/1/replay
+```
+
+The end-to-end tests demonstrate real database outages, four delivery attempts, dead-letter persistence, and recovery after repair for every service. Tests measure increasing retry delays, verify transient recovery without a DLQ entry, and prove that a DLQ storage outage cannot create a recursive publish loop. Replay enqueueing and its status marker roll back together. Malformed JSON is also quarantined, and a failed replay returns to the failed service's DLQ only. Mock payment declines are intentionally not technical failures, so the payment failure-rate switch does not populate this page.
+
+Operational trade-offs: DLQ handoff allows later records to progress, so replay can arrive out of order. This small saga's state guards and stable event IDs are the safety boundary; arbitrary historical reordering is not supported. Dead letters and replay outbox rows are retained without automatic pruning. APIs are unauthenticated for the local portfolio demo; protect operator endpoints before external deployment. Polling publication remains an indefinitely retried durable queue, distinct from the bounded consumer retry budget. Topic replication remains one for local development.
+
 ## Build and test
 
 Use JDK 21 and Maven 3.6.3+ with a running Docker-compatible runtime:
@@ -165,7 +190,7 @@ JUnit stops test containers on normal completion; interrupted Podman runs may ne
 
 ## Decisions and trade-offs
 
-- Separate PostgreSQL containers isolate service ownership at a small local resource cost. V1 creates each service namespace; V2 creates its business tables; V3 adds cancellation, failed payments, and release tracking; V4 adds outbox and processed-event tables. Earlier migrations are unchanged.
+- Separate PostgreSQL containers isolate service ownership at a small local resource cost. V1 creates each service namespace; V2 creates its business tables; V3 adds cancellation, failed payments, and release tracking; V4 adds outbox and processed-event tables; V5 adds dead-letter storage and outbox routing for replay. Earlier migrations are unchanged.
 - One Kafka broker/controller in KRaft mode keeps local startup simple. It provides no broker redundancy, uses plaintext locally, and needs no Zookeeper.
 - A single parameterized Dockerfile builds the small reactor in a shared layer, then selects each service JAR. This keeps build logic and dependency downloads reusable across images; host Java is unnecessary for Compose startup.
 - The shared module contains contracts only. Business behavior stays in its owning service.
@@ -175,7 +200,7 @@ JUnit stops test containers on normal completion; interrupted Podman runs may ne
 - Business changes, processed-event claims, and outgoing events commit atomically in each service database. Publishers provide at-least-once delivery using stable event IDs; consumers deduplicate those IDs. Sent outbox rows and processed IDs are retained for now. Deleting deduplication history while old events can still be replayed would break this guarantee.
 - V4 does not backfill IDs for events processed before this phase or recover events lost before an outbox existed. Preserve existing consumer offsets during upgrades; do not replay pre-V4 history into databases containing old business effects.
 - The reliability adapters remain local to each of the three services; `common-events` stays limited to contracts. A shared runtime library is deferred until further changes justify that abstraction.
-- Inventory shortages and mock payment declines are business outcomes, so they emit failure events rather than throwing infrastructure errors. Database and broker faults still surface as technical errors. Configured retries/DLQ arrive in Phase 5 and concurrency safety in Phase 6.
+- Inventory shortages and mock payment declines are business outcomes, so they emit failure events rather than throwing infrastructure errors. Database and broker faults still surface as technical errors. Technical consumer failures use bounded retries and DLQ recovery; concurrency safety arrives in Phase 6.
 - On a payment failure, inventory emits `InventoryReleased` after its release transaction, and order-service then records cancellation. Release marks the existing reservation and restores stock in one database transaction. Its released flag prevents sequential repeated releases from adding stock again, and the processed-event table now prevents repeated incoming events from running the transaction again. Concurrency safety between different orders still arrives in Phase 6. Terminal order states cannot change from confirmed to cancelled or vice versa.
 - Correlation IDs are carried in the envelope and successful order HTTP responses. Listener processing uses MDC; full HTTP MDC coverage, error-response correlation, and structured logging remain later observability work.
 

@@ -16,10 +16,10 @@ public class Payment {
 
     protected Payment() {}
 
-    public Payment(OrderData order) {
+    public Payment(OrderData order, boolean succeeded) {
         orderId = order.orderId();
         totalAmount = order.totalAmount();
-        status = "SUCCEEDED";
+        status = succeeded ? "SUCCEEDED" : "FAILED";
         processedAt = Instant.now();
     }
 }

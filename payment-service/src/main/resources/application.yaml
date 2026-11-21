@@ -43,3 +43,5 @@ management:
       group:
         readiness:
           include: readinessState,db
+payment:
+  failure-rate: ${PAYMENT_FAILURE_RATE:0}

@@ -10,10 +10,21 @@ public class Stock {
 
     protected Stock() {}
 
-    public void reserve(int quantity) {
-        if (quantity <= 0 || available < quantity) {
-            throw new IllegalStateException("Insufficient stock for " + sku);
+    public boolean reserve(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("Reservation quantity must be positive");
+        }
+        if (available < quantity) {
+            return false;
         }
         available -= quantity;
+        return true;
+    }
+
+    public void release(int quantity) {
+        if (quantity <= 0) {
+            throw new IllegalArgumentException("Release quantity must be positive");
+        }
+        available = Math.addExact(available, quantity);
     }
 }

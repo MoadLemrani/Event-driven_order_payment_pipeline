@@ -29,6 +29,13 @@ public class OrderService {
         return OrderResponse.from(order);
     }
 
+    @Transactional
+    public OrderResponse cancel(UUID id) {
+        var order = find(id);
+        order.cancel();
+        return OrderResponse.from(order);
+    }
+
     private Order find(UUID id) {
         return orders.findById(id).orElseThrow(() -> new OrderNotFoundException(id));
     }

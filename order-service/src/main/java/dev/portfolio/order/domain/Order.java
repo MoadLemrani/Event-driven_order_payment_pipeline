@@ -30,7 +30,15 @@ public class Order {
         this.createdAt = Instant.now();
     }
 
-    public void confirm() { status = OrderStatus.CONFIRMED; }
+    public void confirm() { transitionTo(OrderStatus.CONFIRMED); }
+    public void cancel() { transitionTo(OrderStatus.CANCELLED); }
+
+    private void transitionTo(OrderStatus target) {
+        if (status != OrderStatus.CREATED && status != target) {
+            throw new IllegalStateException("Cannot change terminal order status " + status + " to " + target);
+        }
+        status = target;
+    }
     public OrderData data() { return new OrderData(id, sku, quantity, totalAmount); }
     public UUID getId() { return id; }
     public String getSku() { return sku; }

@@ -10,6 +10,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -36,7 +37,7 @@ import static org.awaitility.Awaitility.await;
 
 /** Black-box test: three real executable JARs, Kafka, and three independent databases. */
 @Testcontainers
-class HappyPathIT {
+class SagaIT {
     @Container static final KafkaContainer KAFKA = new KafkaContainer("apache/kafka:3.9.1");
     @Container static final PostgreSQLContainer<?> ORDER_DB = database("orders");
     @Container static final PostgreSQLContainer<?> INVENTORY_DB = database("inventory");
@@ -56,28 +57,40 @@ class HappyPathIT {
         SERVICES.add(start("inventory", INVENTORY_DB));
         SERVICES.add(start("payment", PAYMENT_DB));
         for (var service : SERVICES) {
-            await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofMillis(300)).untilAsserted(() -> {
-                assertThat(service.process().isAlive()).withFailMessage(() -> readLog(service)).isTrue();
-                var matcher = Pattern.compile("Tomcat started on port (\\d+)").matcher(readLog(service));
-                assertThat(matcher.find()).withFailMessage(() -> readLog(service)).isTrue();
-                var base = URI.create("http://localhost:" + matcher.group(1));
-                assertThat(get(base.resolve("/actuator/health/readiness")).statusCode()).isEqualTo(200);
-                if (service.name().equals("order")) {
-                    orderUrl = base;
-                }
-            });
+            URI base = awaitReady(service);
+            if (service.name().equals("order")) {
+                orderUrl = base;
+            }
         }
     }
 
+    private static URI awaitReady(RunningService service) {
+        var result = new java.util.concurrent.atomic.AtomicReference<URI>();
+        await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofMillis(300)).untilAsserted(() -> {
+            assertThat(service.process().isAlive()).withFailMessage(() -> readLog(service)).isTrue();
+            var matcher = Pattern.compile("Tomcat started on port (\\d+)").matcher(readLog(service));
+            assertThat(matcher.find()).withFailMessage(() -> readLog(service)).isTrue();
+            var base = URI.create("http://localhost:" + matcher.group(1));
+            assertThat(get(base.resolve("/actuator/health/readiness")).statusCode()).isEqualTo(200);
+            result.set(base);
+        });
+        return result.get();
+    }
+
     private static RunningService start(String name, PostgreSQLContainer<?> database) throws Exception {
+        return start(name, database, "0");
+    }
+
+    private static RunningService start(String name, PostgreSQLContainer<?> database, String failureRate)
+            throws Exception {
         var root = Path.of(System.getProperty("projectRoot"));
         var jar = root.resolve(name + "-service/target/" + name + "-service-"
             + System.getProperty("projectVersion") + ".jar");
         assertThat(jar).isRegularFile();
         var logs = root.resolve("pipeline-tests/target/service-logs");
         Files.createDirectories(logs);
-        var log = logs.resolve(name + ".log");
-        var process = new ProcessBuilder(
+        var log = logs.resolve(name + "-" + failureRate + ".log");
+        var builder = new ProcessBuilder(
             Path.of(System.getProperty("java.home"), "bin", "java").toString(),
             "-Xmx192m", "-XX:ActiveProcessorCount=2", "-jar", jar.toString(),
             "--server.port=0", "--spring.datasource.url=" + database.getJdbcUrl(),
@@ -85,8 +98,9 @@ class HappyPathIT {
             "--spring.datasource.password=" + database.getPassword(),
             "--spring.kafka.bootstrap-servers=" + KAFKA.getBootstrapServers(),
             "--logging.level.root=INFO", "--spring.output.ansi.enabled=never")
-            .redirectErrorStream(true).redirectOutput(log.toFile()).start();
-        return new RunningService(name, process, log);
+            .redirectErrorStream(true).redirectOutput(log.toFile());
+        builder.environment().put("PAYMENT_FAILURE_RATE", failureRate);
+        return new RunningService(name, builder.start(), log);
     }
 
     @AfterAll
@@ -136,26 +150,8 @@ class HappyPathIT {
             assertThat(JSON.readTree(result.body()).path("status").asText()).isEqualTo("CONFIRMED");
         });
 
-        var observed = new ArrayList<JsonNode>();
-        try (var consumer = new KafkaConsumer<String, String>(Map.of(
-                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
-                ConsumerConfig.GROUP_ID_CONFIG, "assert-events-" + UUID.randomUUID(),
-                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
-                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
-                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
-                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class))) {
-            consumer.subscribe(List.of("order-events"));
-            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                for (var record : consumer.poll(Duration.ofMillis(200))) {
-                    if (id.equals(record.key())) {
-                        observed.add(JSON.readTree(record.value()));
-                    }
-                }
-                assertThat(observed).extracting(e -> e.path("eventType").asText())
-                    .containsExactly("OrderCreated", "InventoryReserved", "PaymentSucceeded", "OrderConfirmed");
-            });
-        }
-        assertThat(observed).extracting(e -> e.path("eventId").asText()).doesNotHaveDuplicates();
+        var observed = readEvents(id, trace,
+            "OrderCreated", "InventoryReserved", "PaymentSucceeded", "OrderConfirmed");
         for (var event : observed) {
             assertThat(UUID.fromString(event.path("eventId").asText())).isNotNull();
             assertThat(java.time.Instant.parse(event.path("occurredAt").asText())).isNotNull();
@@ -212,6 +208,133 @@ class HappyPathIT {
             .build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.orders")).isEqualTo(before);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"DEMO-SKU,1000", "UNKNOWN-SKU,1"})
+    void inventoryFailureCancelsWithoutReservationOrPayment(String sku, int quantity) throws Exception {
+        long stockBefore = availableStock();
+        String trace = "inventory-failure-" + UUID.randomUUID();
+        String id = createOrder(sku, quantity, trace);
+        awaitStatus(id, "CANCELLED");
+        readEvents(id, trace, "OrderCreated", "InventoryFailed", "OrderCancelled");
+        assertThat(availableStock()).isEqualTo(stockBefore);
+        assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '"
+            + id + "'")).isZero();
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
+            + id + "'")).isZero();
+    }
+
+    @Test
+    void paymentFailureReleasesRecordedStockBeforeCancellingAndStockCanBeReused() throws Exception {
+        long stockBefore = availableStock();
+        String trace = "payment-failure-" + UUID.randomUUID();
+        stopPayment();
+        try {
+            String id = createOrder("DEMO-SKU", 2, trace);
+            // Hold payment offline so we can prove the stock was actually reserved before compensation.
+            await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+                assertThat(count(INVENTORY_DB,
+                    "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '" + id
+                        + "' AND quantity = 2 AND NOT released")).isEqualTo(1);
+                assertThat(availableStock()).isEqualTo(stockBefore - 2);
+            });
+            assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body())
+                .path("status").asText()).isEqualTo("CREATED");
+            startPayment("1");
+            awaitStatus(id, "CANCELLED");
+            readEvents(id, trace, "OrderCreated", "InventoryReserved", "PaymentFailed",
+                "InventoryReleased", "OrderCancelled");
+            assertThat(availableStock()).isEqualTo(stockBefore);
+            assertThat(count(INVENTORY_DB,
+                "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '" + id
+                    + "' AND quantity = 2 AND released")).isEqualTo(1);
+            assertThat(count(PAYMENT_DB,
+                "SELECT count(*) FROM payment_service.payments WHERE order_id = '" + id
+                    + "' AND total_amount = 19.98 AND status = 'FAILED'")).isEqualTo(1);
+        } finally {
+            stopPayment();
+            startPayment("0");
+        }
+        String recoveryTrace = "after-compensation-" + UUID.randomUUID();
+        String recoveryId = createOrder("DEMO-SKU", 2, recoveryTrace);
+        awaitStatus(recoveryId, "CONFIRMED");
+        readEvents(recoveryId, recoveryTrace,
+            "OrderCreated", "InventoryReserved", "PaymentSucceeded", "OrderConfirmed");
+        assertThat(availableStock()).isEqualTo(stockBefore - 2);
+    }
+
+    private static void stopPayment() throws Exception {
+        for (var service : List.copyOf(SERVICES)) {
+            if (service.name().equals("payment")) {
+                service.process().destroy();
+                if (!service.process().waitFor(10, TimeUnit.SECONDS)) {
+                    service.process().destroyForcibly().waitFor(10, TimeUnit.SECONDS);
+                }
+                SERVICES.remove(service);
+            }
+        }
+    }
+
+    private static void startPayment(String failureRate) throws Exception {
+        var service = start("payment", PAYMENT_DB, failureRate);
+        SERVICES.add(service);
+        awaitReady(service);
+    }
+
+    private static String createOrder(String sku, int quantity, String trace) throws Exception {
+        var response = HTTP.send(HttpRequest.newBuilder(orderUrl.resolve("/orders"))
+            .header("Content-Type", "application/json").header("X-Correlation-ID", trace)
+            .timeout(Duration.ofSeconds(20))
+            .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
+                "sku", sku, "quantity", quantity, "totalAmount", new java.math.BigDecimal("19.98")))))
+            .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(201);
+        assertThat(response.headers().firstValue("X-Correlation-ID")).contains(trace);
+        return JSON.readTree(response.body()).path("id").asText();
+    }
+
+    private static void awaitStatus(String id, String status) {
+        await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
+            var response = get(orderUrl.resolve("/orders/" + id));
+            assertThat(response.statusCode()).isEqualTo(200);
+            assertThat(JSON.readTree(response.body()).path("status").asText()).isEqualTo(status);
+        });
+    }
+
+    private static long availableStock() throws Exception {
+        return count(INVENTORY_DB, "SELECT available FROM inventory_service.stock WHERE sku = 'DEMO-SKU'");
+    }
+
+    private static List<JsonNode> readEvents(String id, String trace, String... types) throws Exception {
+        var observed = new ArrayList<JsonNode>();
+        try (var consumer = new KafkaConsumer<String, String>(Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+                ConsumerConfig.GROUP_ID_CONFIG, "assert-events-" + UUID.randomUUID(),
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class))) {
+            consumer.subscribe(List.of("order-events"));
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                for (var record : consumer.poll(Duration.ofMillis(200))) {
+                    if (id.equals(record.key())) {
+                        observed.add(JSON.readTree(record.value()));
+                    }
+                }
+                assertThat(observed).extracting(e -> e.path("eventType").asText())
+                    .containsExactly(types);
+            });
+        }
+        assertThat(observed).extracting(e -> e.path("eventId").asText()).doesNotHaveDuplicates();
+        for (var event : observed) {
+            assertThat(UUID.fromString(event.path("eventId").asText())).isNotNull();
+            assertThat(java.time.Instant.parse(event.path("occurredAt").asText())).isNotNull();
+            assertThat(event.path("version").asInt()).isEqualTo(1);
+            assertThat(event.path("correlationId").asText()).isEqualTo(trace);
+            assertThat(event.path("payload").path("orderId").asText()).isEqualTo(id);
+        }
+        return observed;
     }
 
     private static HttpResponse<String> get(URI uri) throws Exception {

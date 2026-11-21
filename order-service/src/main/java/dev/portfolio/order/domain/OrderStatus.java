@@ -1,5 +1,5 @@
 package dev.portfolio.order.domain;
 
 public enum OrderStatus {
-    CREATED, CONFIRMED
+    CREATED, CONFIRMED, CANCELLED
 }

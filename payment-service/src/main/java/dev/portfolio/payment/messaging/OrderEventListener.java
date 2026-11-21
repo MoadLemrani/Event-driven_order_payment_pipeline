@@ -35,8 +35,9 @@ public class OrderEventListener {
             throw new IllegalArgumentException("Unsupported event version " + event.version());
         }
         try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
-            service.pay(event.payload());
-            events.publish(OrderEvents.PAYMENT_SUCCEEDED, event.correlationId(), event.payload());
+            boolean succeeded = service.pay(event.payload());
+            events.publish(succeeded ? OrderEvents.PAYMENT_SUCCEEDED : OrderEvents.PAYMENT_FAILED,
+                event.correlationId(), event.payload());
             log.info("Processed {} for order {}", event.eventType(), event.payload().orderId());
         }
     }

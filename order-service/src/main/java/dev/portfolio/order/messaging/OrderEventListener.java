@@ -28,15 +28,23 @@ public class OrderEventListener {
     @KafkaListener(topics = OrderEvents.TOPIC)
     public void onEvent(String message) throws JsonProcessingException {
         EventEnvelope<OrderData> event = json.readValue(message, EVENT_TYPE);
-        if (!OrderEvents.PAYMENT_SUCCEEDED.equals(event.eventType())) {
+        if (!OrderEvents.PAYMENT_SUCCEEDED.equals(event.eventType())
+                && !OrderEvents.INVENTORY_FAILED.equals(event.eventType())
+                && !OrderEvents.INVENTORY_RELEASED.equals(event.eventType())) {
             return;
         }
         if (event.version() != 1) {
             throw new IllegalArgumentException("Unsupported event version " + event.version());
         }
         try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
-            var confirmed = service.confirm(event.payload().orderId());
-            events.publish(OrderEvents.CONFIRMED, confirmed.correlationId(), confirmed.data());
+            if (OrderEvents.PAYMENT_SUCCEEDED.equals(event.eventType())) {
+                var confirmed = service.confirm(event.payload().orderId());
+                events.publish(OrderEvents.CONFIRMED, confirmed.correlationId(), confirmed.data());
+            } else {
+                // Payment failure becomes terminal only after inventory confirms compensation.
+                var cancelled = service.cancel(event.payload().orderId());
+                events.publish(OrderEvents.CANCELLED, cancelled.correlationId(), cancelled.data());
+            }
             log.info("Processed {} for order {}", event.eventType(), event.payload().orderId());
         }
     }

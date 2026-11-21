@@ -2,6 +2,11 @@ package dev.portfolio.pipeline;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.serialization.StringDeserializer;
@@ -83,13 +88,18 @@ class SagaIT {
 
     private static RunningService start(String name, PostgreSQLContainer<?> database, String failureRate)
             throws Exception {
+        return start(name, database, failureRate, true);
+    }
+
+    private static RunningService start(String name, PostgreSQLContainer<?> database, String failureRate,
+                                        boolean publisherEnabled) throws Exception {
         var root = Path.of(System.getProperty("projectRoot"));
         var jar = root.resolve(name + "-service/target/" + name + "-service-"
             + System.getProperty("projectVersion") + ".jar");
         assertThat(jar).isRegularFile();
         var logs = root.resolve("pipeline-tests/target/service-logs");
         Files.createDirectories(logs);
-        var log = logs.resolve(name + "-" + failureRate + ".log");
+        var log = logs.resolve(name + "-" + failureRate + "-publisher-" + publisherEnabled + ".log");
         var builder = new ProcessBuilder(
             Path.of(System.getProperty("java.home"), "bin", "java").toString(),
             "-Xmx192m", "-XX:ActiveProcessorCount=2", "-jar", jar.toString(),
@@ -100,6 +110,7 @@ class SagaIT {
             "--logging.level.root=INFO", "--spring.output.ansi.enabled=never")
             .redirectErrorStream(true).redirectOutput(log.toFile());
         builder.environment().put("PAYMENT_FAILURE_RATE", failureRate);
+        builder.environment().put("OUTBOX_PUBLISHER_ENABLED", Boolean.toString(publisherEnabled));
         return new RunningService(name, builder.start(), log);
     }
 
@@ -217,7 +228,9 @@ class SagaIT {
         String trace = "inventory-failure-" + UUID.randomUUID();
         String id = createOrder(sku, quantity, trace);
         awaitStatus(id, "CANCELLED");
-        readEvents(id, trace, "OrderCreated", "InventoryFailed", "OrderCancelled");
+        var failureEvents = readEvents(id, trace, "OrderCreated", "InventoryFailed", "OrderCancelled");
+        duplicateAndDrain(failureEvents);
+        assertOutboxCounts(id, 2, 1, 0);
         assertThat(availableStock()).isEqualTo(stockBefore);
         assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '"
             + id + "'")).isZero();
@@ -230,6 +243,7 @@ class SagaIT {
         long stockBefore = availableStock();
         String trace = "payment-failure-" + UUID.randomUUID();
         stopPayment();
+        List<JsonNode> failedEvents = new ArrayList<>();
         try {
             String id = createOrder("DEMO-SKU", 2, trace);
             // Hold payment offline so we can prove the stock was actually reserved before compensation.
@@ -243,7 +257,7 @@ class SagaIT {
                 .path("status").asText()).isEqualTo("CREATED");
             startPayment("1");
             awaitStatus(id, "CANCELLED");
-            readEvents(id, trace, "OrderCreated", "InventoryReserved", "PaymentFailed",
+            failedEvents = readEvents(id, trace, "OrderCreated", "InventoryReserved", "PaymentFailed",
                 "InventoryReleased", "OrderCancelled");
             assertThat(availableStock()).isEqualTo(stockBefore);
             assertThat(count(INVENTORY_DB,
@@ -256,6 +270,13 @@ class SagaIT {
             stopPayment();
             startPayment("0");
         }
+        // Redeliver after changing the payment failure rate: an already processed decision must not change.
+        duplicateAndDrain(failedEvents);
+        String failedId = failedEvents.getFirst().path("payload").path("orderId").asText();
+        assertThat(availableStock()).isEqualTo(stockBefore);
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
+            + failedId + "' AND status = 'FAILED'")).isEqualTo(1);
+        assertOutboxCounts(failedId, 2, 2, 1);
         String recoveryTrace = "after-compensation-" + UUID.randomUUID();
         String recoveryId = createOrder("DEMO-SKU", 2, recoveryTrace);
         awaitStatus(recoveryId, "CONFIRMED");
@@ -264,22 +285,215 @@ class SagaIT {
         assertThat(availableStock()).isEqualTo(stockBefore - 2);
     }
 
-    private static void stopPayment() throws Exception {
+    private static void stopPayment() throws Exception { stopService("payment", false); }
+
+    private static void startPayment(String failureRate) throws Exception {
+        restartService("payment", failureRate, true);
+    }
+
+    private static void stopService(String name, boolean crash) throws Exception {
         for (var service : List.copyOf(SERVICES)) {
-            if (service.name().equals("payment")) {
-                service.process().destroy();
+            if (service.name().equals(name)) {
+                if (crash) {
+                    service.process().destroyForcibly();
+                } else {
+                    service.process().destroy();
+                }
                 if (!service.process().waitFor(10, TimeUnit.SECONDS)) {
                     service.process().destroyForcibly().waitFor(10, TimeUnit.SECONDS);
                 }
+                assertThat(service.process().isAlive()).isFalse();
                 SERVICES.remove(service);
             }
         }
     }
 
-    private static void startPayment(String failureRate) throws Exception {
-        var service = start("payment", PAYMENT_DB, failureRate);
+    private static void restartService(String name, String failureRate, boolean publisherEnabled) throws Exception {
+        var service = start(name, serviceDatabase(name), failureRate, publisherEnabled);
         SERVICES.add(service);
-        awaitReady(service);
+        var base = awaitReady(service);
+        if (name.equals("order")) {
+            orderUrl = base;
+        }
+    }
+
+    private static PostgreSQLContainer<?> serviceDatabase(String name) {
+        return switch (name) {
+            case "order" -> ORDER_DB;
+            case "inventory" -> INVENTORY_DB;
+            case "payment" -> PAYMENT_DB;
+            default -> throw new IllegalArgumentException(name);
+        };
+    }
+
+    @Test
+    void duplicateKafkaDeliveriesDoNotRepeatBusinessEffectsOrCreateNewEvents() throws Exception {
+        long before = availableStock();
+        String trace = "duplicates-" + UUID.randomUUID();
+        String id = createOrder("DEMO-SKU", 2, trace);
+        awaitStatus(id, "CONFIRMED");
+        var events = readEvents(id, trace,
+            "OrderCreated", "InventoryReserved", "PaymentSucceeded", "OrderConfirmed");
+        duplicateAndDrain(events);
+        assertThat(availableStock()).isEqualTo(before - 2);
+        assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '"
+            + id + "' AND quantity = 2 AND NOT released")).isEqualTo(1);
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
+            + id + "' AND status = 'SUCCEEDED'")).isEqualTo(1);
+        assertOutboxCounts(id, 2, 1, 1);
+        for (var pair : Map.of("inventory", events.get(0), "payment", events.get(1), "order", events.get(2)).entrySet()) {
+            assertThat(count(serviceDatabase(pair.getKey()), "SELECT count(*) FROM " + pair.getKey()
+                + "_service.processed_events WHERE event_id = '" + pair.getValue().path("eventId").asText() + "'"))
+                .isEqualTo(1);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"order", "inventory", "payment"})
+    void committedOutboxSurvivesProcessDeathBeforePublication(String name) throws Exception {
+        long before = availableStock();
+        var db = serviceDatabase(name);
+        String trace = "crash-" + name + "-" + UUID.randomUUID();
+        String id;
+        String pendingId;
+        stopService(name, false);
+        try {
+            // Disable only the poller. All business transactions and consumers run normally.
+            restartService(name, "0", false);
+            id = createOrder("DEMO-SKU", 2, trace);
+            String query = "SELECT count(*) FROM " + name + "_service.outbox_events WHERE aggregate_id = '"
+                + id + "' AND sent_at IS NULL";
+            await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> assertThat(count(db, query)).isEqualTo(1));
+            pendingId = scalar(db, "SELECT event_id FROM " + name
+                + "_service.outbox_events WHERE aggregate_id = '" + id + "' AND sent_at IS NULL");
+            assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body()).path("status").asText())
+                .isEqualTo("CREATED");
+            if (name.equals("order")) {
+                assertThat(availableStock()).isEqualTo(before);
+            } else {
+                assertThat(availableStock()).isEqualTo(before - 2);
+                assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.reservations WHERE order_id = '"
+                    + id + "'")).isEqualTo(1);
+            }
+            if (name.equals("payment")) {
+                assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
+                    + id + "' AND status = 'SUCCEEDED'")).isEqualTo(1);
+            }
+            stopService(name, true); // actual forcible process termination, not an exception/mock
+            assertThat(count(db, query)).isEqualTo(1);
+        } finally {
+            stopService(name, false);
+            restartService(name, "0", true);
+        }
+        awaitStatus(id, "CONFIRMED");
+        var events = readEvents(id, trace,
+            "OrderCreated", "InventoryReserved", "PaymentSucceeded", "OrderConfirmed");
+        assertThat(events).extracting(e -> e.path("eventId").asText()).contains(pendingId);
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            assertThat(count(db, "SELECT count(*) FROM " + name
+                + "_service.outbox_events WHERE aggregate_id = '" + id + "' AND sent_at IS NULL")).isZero());
+        assertThat(availableStock()).isEqualTo(before - 2);
+        assertOutboxCounts(id, 2, 1, 1);
+    }
+
+    @Test
+    void kafkaAcknowledgementBeforeSentMarkerFailureCausesSafeRedelivery() throws Exception {
+        long before = availableStock();
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.outbox_events WHERE sent_at IS NULL")).isZero());
+        // A real PostgreSQL failure after Kafka acknowledges the record reproduces the ambiguous-send window.
+        execute(ORDER_DB, "ALTER TABLE order_service.outbox_events ADD CONSTRAINT test_block_sent "
+            + "CHECK (sent_at IS NULL) NOT VALID");
+        String id;
+        List<JsonNode> deliveries = new ArrayList<>();
+        try {
+            id = createOrder("DEMO-SKU", 2, "ack-window-" + UUID.randomUUID());
+            awaitStatus(id, "CONFIRMED");
+            try (var consumer = new KafkaConsumer<String, String>(Map.of(
+                    ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, KAFKA.getBootstrapServers(),
+                    ConsumerConfig.GROUP_ID_CONFIG, "ack-window-" + UUID.randomUUID(),
+                    ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                    ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false,
+                    ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                    ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class))) {
+                consumer.subscribe(List.of("order-events"));
+                await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                    for (var record : consumer.poll(Duration.ofMillis(200))) {
+                        if (id.equals(record.key())) {
+                            var event = JSON.readTree(record.value());
+                            if ("OrderCreated".equals(event.path("eventType").asText())) {
+                                deliveries.add(event);
+                            }
+                        }
+                    }
+                    assertThat(deliveries.size()).isGreaterThanOrEqualTo(2);
+                });
+            }
+            assertThat(deliveries).allMatch(event -> event.equals(deliveries.getFirst()));
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.outbox_events WHERE aggregate_id = '"
+                + id + "' AND sent_at IS NULL")).isEqualTo(2);
+        } finally {
+            execute(ORDER_DB, "ALTER TABLE order_service.outbox_events DROP CONSTRAINT test_block_sent");
+        }
+        await().atMost(Duration.ofSeconds(15)).untilAsserted(() ->
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.outbox_events WHERE aggregate_id = '"
+                + id + "' AND sent_at IS NULL")).isZero());
+        duplicateAndDrain(deliveries);
+        assertThat(availableStock()).isEqualTo(before - 2);
+        assertOutboxCounts(id, 2, 1, 1);
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
+            + id + "' AND status = 'SUCCEEDED'")).isEqualTo(1);
+    }
+
+    private static void execute(PostgreSQLContainer<?> db, String sql) throws Exception {
+        try (var connection = DriverManager.getConnection(db.getJdbcUrl(), db.getUsername(), db.getPassword());
+             var statement = connection.createStatement()) {
+            statement.execute(sql);
+        }
+    }
+
+    private static void assertOutboxCounts(String id, long order, long inventory, long payment) throws Exception {
+        for (var entry : Map.of("order", order, "inventory", inventory, "payment", payment).entrySet()) {
+            assertThat(count(serviceDatabase(entry.getKey()), "SELECT count(*) FROM " + entry.getKey()
+                + "_service.outbox_events WHERE aggregate_id = '" + id + "'")).isEqualTo(entry.getValue());
+        }
+    }
+
+    private static void duplicateAndDrain(List<JsonNode> events) throws Exception {
+        var offsets = new java.util.HashMap<TopicPartition, Long>();
+        try (var producer = new KafkaProducer<String, String>(Map.of(
+                "bootstrap.servers", KAFKA.getBootstrapServers(), "acks", "all",
+                "key.serializer", StringSerializer.class, "value.serializer", StringSerializer.class))) {
+            for (int copy = 0; copy < 3; copy++) {
+                for (var event : events) {
+                    var metadata = producer.send(new ProducerRecord<>("order-events",
+                        event.path("payload").path("orderId").asText(), JSON.writeValueAsString(event)))
+                        .get(15, TimeUnit.SECONDS);
+                    offsets.merge(new TopicPartition(metadata.topic(), metadata.partition()), metadata.offset() + 1, Math::max);
+                }
+            }
+        }
+        // Wait for each real consumer group to commit past the duplicate records before checking DB state.
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                for (String group : List.of("order-service", "inventory-service", "payment-service")) {
+                    var committed = admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata()
+                        .get(10, TimeUnit.SECONDS);
+                    for (var entry : offsets.entrySet()) {
+                        assertThat(committed).containsKey(entry.getKey());
+                        assertThat(committed.get(entry.getKey()).offset()).isGreaterThanOrEqualTo(entry.getValue());
+                    }
+                }
+            });
+        }
+    }
+
+    private static String scalar(PostgreSQLContainer<?> db, String sql) throws Exception {
+        try (var connection = DriverManager.getConnection(db.getJdbcUrl(), db.getUsername(), db.getPassword());
+             var statement = connection.createStatement(); var result = statement.executeQuery(sql)) {
+            assertThat(result.next()).isTrue();
+            return result.getString(1);
+        }
     }
 
     private static String createOrder(String sku, int quantity, String trace) throws Exception {

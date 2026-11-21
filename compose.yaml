@@ -55,6 +55,8 @@ services:
         SERVICE: order-service
     environment:
       SERVER_PORT: 8080
+      OUTBOX_PUBLISHER_ENABLED: ${ORDER_OUTBOX_PUBLISHER_ENABLED:-true}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-250}
       DB_URL: jdbc:postgresql://order-db:5432/order_db
       DB_USERNAME: order
       DB_PASSWORD: order_local
@@ -89,6 +91,8 @@ services:
         SERVICE: inventory-service
     environment:
       SERVER_PORT: 8080
+      OUTBOX_PUBLISHER_ENABLED: ${INVENTORY_OUTBOX_PUBLISHER_ENABLED:-true}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-250}
       DB_URL: jdbc:postgresql://inventory-db:5432/inventory_db
       DB_USERNAME: inventory
       DB_PASSWORD: inventory_local
@@ -123,6 +127,8 @@ services:
         SERVICE: payment-service
     environment:
       SERVER_PORT: 8080
+      OUTBOX_PUBLISHER_ENABLED: ${PAYMENT_OUTBOX_PUBLISHER_ENABLED:-true}
+      OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-250}
       PAYMENT_FAILURE_RATE: ${PAYMENT_FAILURE_RATE:-0}
       DB_URL: jdbc:postgresql://payment-db:5432/payment_db
       DB_USERNAME: payment

@@ -43,3 +43,6 @@ management:
       group:
         readiness:
           include: readinessState,db
+outbox:
+  publisher-enabled: ${OUTBOX_PUBLISHER_ENABLED:true}
+  poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:250}

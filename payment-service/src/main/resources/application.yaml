@@ -45,3 +45,6 @@ management:
           include: readinessState,db
 payment:
   failure-rate: ${PAYMENT_FAILURE_RATE:0}
+outbox:
+  publisher-enabled: ${OUTBOX_PUBLISHER_ENABLED:true}
+  poll-interval-ms: ${OUTBOX_POLL_INTERVAL_MS:250}

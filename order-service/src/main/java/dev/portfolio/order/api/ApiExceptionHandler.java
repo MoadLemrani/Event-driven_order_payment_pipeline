@@ -1,7 +1,6 @@
 package dev.portfolio.order.api;
 
 import dev.portfolio.order.application.OrderNotFoundException;
-import dev.portfolio.order.messaging.EventPublisher.PublicationException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -13,10 +12,5 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     @ExceptionHandler(OrderNotFoundException.class)
     ProblemDetail notFound(OrderNotFoundException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
-    }
-
-    @ExceptionHandler(PublicationException.class)
-    ProblemDetail unavailable(PublicationException ex) {
-        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage());
     }
 }

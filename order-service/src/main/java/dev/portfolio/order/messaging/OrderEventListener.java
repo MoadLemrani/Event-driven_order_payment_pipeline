@@ -17,12 +17,10 @@ public class OrderEventListener {
     private static final TypeReference<EventEnvelope<OrderData>> EVENT_TYPE = new TypeReference<>() {};
     private final ObjectMapper json;
     private final OrderService service;
-    private final EventPublisher events;
 
-    public OrderEventListener(ObjectMapper json, OrderService service, EventPublisher events) {
+    public OrderEventListener(ObjectMapper json, OrderService service) {
         this.json = json;
         this.service = service;
-        this.events = events;
     }
 
     @KafkaListener(topics = OrderEvents.TOPIC)
@@ -37,15 +35,8 @@ public class OrderEventListener {
             throw new IllegalArgumentException("Unsupported event version " + event.version());
         }
         try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
-            if (OrderEvents.PAYMENT_SUCCEEDED.equals(event.eventType())) {
-                var confirmed = service.confirm(event.payload().orderId());
-                events.publish(OrderEvents.CONFIRMED, confirmed.correlationId(), confirmed.data());
-            } else {
-                // Payment failure becomes terminal only after inventory confirms compensation.
-                var cancelled = service.cancel(event.payload().orderId());
-                events.publish(OrderEvents.CANCELLED, cancelled.correlationId(), cancelled.data());
-            }
-            log.info("Processed {} for order {}", event.eventType(), event.payload().orderId());
+            service.handle(event);
+            log.info("Handled {} for order {}", event.eventType(), event.payload().orderId());
         }
     }
 }

@@ -1,6 +1,14 @@
 package dev.portfolio.order;
 
 import org.junit.jupiter.api.Test;
+import dev.portfolio.order.application.OrderService;
+import dev.portfolio.events.EventEnvelope;
+import dev.portfolio.events.OrderData;
+import dev.portfolio.events.OrderEvents;
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.UUID;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
@@ -30,15 +38,18 @@ class OrderApplicationIT {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
+        registry.add("outbox.publisher-enabled", () -> false);
     }
 
     private final TestRestTemplate http;
     private final JdbcTemplate jdbc;
+    private final OrderService service;
 
     @Autowired
-    OrderApplicationIT(TestRestTemplate http, JdbcTemplate jdbc) {
+    OrderApplicationIT(TestRestTemplate http, JdbcTemplate jdbc, OrderService service) {
         this.http = http;
         this.jdbc = jdbc;
+        this.service = service;
     }
 
     @Test
@@ -54,6 +65,42 @@ class OrderApplicationIT {
         assertThat(jdbc.queryForObject(
             "SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'order_service'", Integer.class))
             .isEqualTo(1);
+    }
+
+    @Test
+    void failedBusinessInsertRollsBackItsOutboxEvent() {
+        String trace = "rollback-create";
+        assertThatThrownBy(() -> service.create("DEMO-SKU", 0, new BigDecimal("1.00"), trace))
+            .isInstanceOf(RuntimeException.class);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.orders WHERE correlation_id = ?",
+            Integer.class, trace)).isZero();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE correlation_id = ?",
+            Integer.class, trace)).isZero();
+    }
+
+    @Test
+    void failedConfirmationRollsBackStatusClaimAndOutboxAndCanBeRetried() {
+        var order = service.create("DEMO-SKU", 1, new BigDecimal("1.00"), "rollback-confirm");
+        var event = new EventEnvelope<>(UUID.randomUUID(), OrderEvents.PAYMENT_SUCCEEDED,
+            order.correlationId(), Instant.now(), 1, order.data());
+        jdbc.execute("ALTER TABLE order_service.orders ADD CONSTRAINT test_keep_created CHECK (status = 'CREATED')");
+        try {
+            assertThatThrownBy(() -> service.handle(event)).isInstanceOf(RuntimeException.class);
+            assertThat(service.get(order.id()).status().name()).isEqualTo("CREATED");
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.processed_events WHERE event_id = ?",
+                Integer.class, event.eventId())).isZero();
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE aggregate_id = ?",
+                Integer.class, order.id())).isEqualTo(1);
+        } finally {
+            jdbc.execute("ALTER TABLE order_service.orders DROP CONSTRAINT test_keep_created");
+        }
+        service.handle(event);
+        service.handle(event);
+        assertThat(service.get(order.id()).status().name()).isEqualTo("CONFIRMED");
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.processed_events WHERE event_id = ?",
+            Integer.class, event.eventId())).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE aggregate_id = ?",
+            Integer.class, order.id())).isEqualTo(2);
     }
 
     @Test

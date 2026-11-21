@@ -1,6 +1,16 @@
 package dev.portfolio.inventory;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import dev.portfolio.inventory.domain.StockRepository;
+import dev.portfolio.inventory.domain.ReservationRepository;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.dao.OptimisticLockingFailureException;
+import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.Executors;
 import dev.portfolio.inventory.application.InventoryService;
 import dev.portfolio.events.EventEnvelope;
 import dev.portfolio.events.OrderData;
@@ -44,12 +54,87 @@ class InventoryApplicationIT {
     private final TestRestTemplate http;
     private final JdbcTemplate jdbc;
     private final InventoryService service;
+    private final StockRepository stocks;
+    private final ReservationRepository reservations;
+    private final TransactionTemplate transactions;
 
     @Autowired
-    InventoryApplicationIT(TestRestTemplate http, JdbcTemplate jdbc, InventoryService service) {
+    InventoryApplicationIT(TestRestTemplate http, JdbcTemplate jdbc, InventoryService service,
+                           StockRepository stocks, ReservationRepository reservations,
+                           PlatformTransactionManager transactionManager) {
         this.http = http;
         this.jdbc = jdbc;
         this.service = service;
+        this.stocks = stocks;
+        this.reservations = reservations;
+        this.transactions = new TransactionTemplate(transactionManager);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void staleReservationOrReleaseRollsBackAllEffectsAndRetriesSafely(boolean releasing) throws Exception {
+        String sku = "RACE-" + UUID.randomUUID();
+        jdbc.update("INSERT INTO inventory_service.stock (sku, available) VALUES (?, 1)", sku);
+        var firstData = new OrderData(UUID.randomUUID(), sku, 1, BigDecimal.ONE);
+        if (releasing) service.handle(event(OrderEvents.CREATED, firstData));
+        var secondData = releasing ? firstData : new OrderData(UUID.randomUUID(), sku, 1, BigDecimal.ONE);
+        String type = releasing ? OrderEvents.PAYMENT_FAILED : OrderEvents.CREATED;
+        var events = List.of(event(type, firstData), event(type, secondData));
+        var barrier = new CyclicBarrier(2);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var futures = events.stream().map(event -> executor.submit(() -> {
+                try {
+                    transactions.executeWithoutResult(status -> {
+                        // Each transaction must load the same version before either can mutate it.
+                        stocks.findById(sku).orElseThrow();
+                        if (releasing) reservations.findById(firstData.orderId()).orElseThrow();
+                        try { barrier.await(10, TimeUnit.SECONDS); }
+                        catch (Exception ex) { throw new IllegalStateException(ex); }
+                        service.handle(event);
+                    });
+                    return true;
+                } catch (OptimisticLockingFailureException expected) {
+                    return false;
+                }
+            })).toList();
+            boolean first = futures.get(0).get(20, TimeUnit.SECONDS);
+            boolean second = futures.get(1).get(20, TimeUnit.SECONDS);
+            assertThat(first).isNotEqualTo(second);
+            var loser = events.get(first ? 1 : 0);
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.processed_events WHERE event_id = ?",
+                Long.class, loser.eventId())).isZero();
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.outbox_events WHERE envelope::jsonb->'payload'->>'sku' = ?",
+                Long.class, sku)).isEqualTo(releasing ? 2 : 1);
+            if (!releasing) {
+                assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.reservations WHERE order_id = ?",
+                    Long.class, loser.payload().orderId())).isZero();
+            }
+            // A fresh transaction reads the winner's version; the winner's duplicate is a no-op.
+            events.forEach(service::handle);
+        }
+        assertThat(jdbc.queryForObject("SELECT available FROM inventory_service.stock WHERE sku = ?", Integer.class, sku))
+            .isEqualTo(releasing ? 1 : 0);
+        assertThat(jdbc.queryForObject("SELECT version FROM inventory_service.stock WHERE sku = ?", Long.class, sku))
+            .isEqualTo(releasing ? 2 : 1);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.reservations WHERE sku = ?", Long.class, sku))
+            .isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.outbox_events WHERE envelope::jsonb->'payload'->>'sku' = ?",
+            Long.class, sku)).isEqualTo(releasing ? 3 : 2);
+        if (releasing) {
+            assertThat(jdbc.queryForObject("SELECT version FROM inventory_service.reservations WHERE order_id = ?",
+                Long.class, firstData.orderId())).isEqualTo(1);
+        } else {
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.outbox_events WHERE event_type = 'InventoryFailed' AND envelope::jsonb->'payload'->>'sku' = ?",
+                Long.class, sku)).isEqualTo(1);
+        }
+        for (var event : events) {
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM inventory_service.processed_events WHERE event_id = ?",
+                Long.class, event.eventId())).isEqualTo(1);
+        }
+    }
+
+    private static EventEnvelope<OrderData> event(String type, OrderData data) {
+        return new EventEnvelope<>(UUID.randomUUID(), type, "inventory-race-" + data.orderId(), Instant.now(), 1, data);
     }
 
     @Test
@@ -71,7 +156,7 @@ class InventoryApplicationIT {
     void failedReservationRollsBackStockClaimAndOutboxAndCanBeRetried() {
         var data = new OrderData(UUID.randomUUID(), "DEMO-SKU", 1, new BigDecimal("1.00"));
         var event = new EventEnvelope<>(UUID.randomUUID(), OrderEvents.CREATED, "rollback-stock", Instant.now(), 1, data);
-        jdbc.execute("ALTER TABLE inventory_service.stock ADD CONSTRAINT test_keep_stock CHECK (available >= 100)");
+        jdbc.execute("ALTER TABLE inventory_service.stock ADD CONSTRAINT test_keep_stock CHECK (sku <> 'DEMO-SKU' OR available >= 100)");
         try {
             assertThatThrownBy(() -> service.handle(event)).isInstanceOf(RuntimeException.class);
             assertThat(jdbc.queryForObject("SELECT available FROM inventory_service.stock WHERE sku = 'DEMO-SKU'",

@@ -605,6 +605,56 @@ class SagaIT {
                 .isEqualTo(1));
     }
 
+    @Test
+    void thirtyConcurrentOrdersCompeteForSevenUnitsWithoutOverselling() throws Exception {
+        String sku = "LIMITED-" + UUID.randomUUID().toString().toUpperCase(java.util.Locale.ROOT);
+        execute(INVENTORY_DB, "INSERT INTO inventory_service.stock (sku, available) VALUES ('" + sku + "', 7)");
+        var requests = new ArrayList<java.util.concurrent.CompletableFuture<HttpResponse<String>>>();
+        for (int i = 0; i < 30; i++) {
+            var request = HttpRequest.newBuilder(orderUrl.resolve("/orders"))
+                .header("Content-Type", "application/json")
+                .header("X-Correlation-ID", "concurrent-" + UUID.randomUUID())
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.ofString(JSON.writeValueAsString(Map.of(
+                    "sku", sku, "quantity", 1, "totalAmount", 1))))
+                .build();
+            requests.add(HTTP.sendAsync(request, HttpResponse.BodyHandlers.ofString()));
+        }
+        var ids = new ArrayList<String>();
+        for (var request : requests) {
+            var response = request.get(35, TimeUnit.SECONDS);
+            assertThat(response.statusCode()).isEqualTo(201);
+            ids.add(JSON.readTree(response.body()).path("id").asText());
+        }
+        assertThat(ids).doesNotHaveDuplicates();
+        await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> {
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.orders WHERE sku = '" + sku
+                + "' AND status = 'CONFIRMED'")).isEqualTo(7);
+            assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.orders WHERE sku = '" + sku
+                + "' AND status = 'CANCELLED'")).isEqualTo(23);
+        });
+        assertThat(count(INVENTORY_DB, "SELECT available FROM inventory_service.stock WHERE sku = '" + sku + "'"))
+            .isZero();
+        assertThat(count(INVENTORY_DB, "SELECT version FROM inventory_service.stock WHERE sku = '" + sku + "'"))
+            .isEqualTo(7);
+        assertThat(count(INVENTORY_DB, "SELECT sum(quantity) FROM inventory_service.reservations WHERE sku = '" + sku + "' AND NOT released"))
+            .isEqualTo(7);
+        String idList = "'" + String.join("','", ids) + "'";
+        assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id IN (" + idList + ") AND status = 'SUCCEEDED'"))
+            .isEqualTo(7);
+        assertThat(count(INVENTORY_DB, "SELECT count(*) FROM inventory_service.outbox_events WHERE aggregate_id IN (" + idList + ") AND event_type = 'InventoryFailed'"))
+            .isEqualTo(23);
+        for (String name : List.of("order", "inventory", "payment")) {
+            assertThat(count(serviceDatabase(name), "SELECT count(*) FROM " + name + "_service.dead_letters WHERE message_key IN (" + idList + ")"))
+                .isZero();
+        }
+        // Confirm that the real inventory consumer group has three active members, not a serial test path.
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            var group = admin.describeConsumerGroups(List.of("inventory-service")).all().get(10, TimeUnit.SECONDS);
+            assertThat(group.get("inventory-service").members()).hasSize(3);
+        }
+    }
+
     private static void execute(PostgreSQLContainer<?> db, String sql) throws Exception {
         try (var connection = DriverManager.getConnection(db.getJdbcUrl(), db.getUsername(), db.getPassword());
              var statement = connection.createStatement()) {

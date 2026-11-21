@@ -8,6 +8,8 @@ public class Stock {
     @Id @Column(length = 64) private String sku;
     @Column(nullable = false) private int available;
 
+    @Version @Column(nullable = false) private long version;
+
     protected Stock() {}
 
     public boolean reserve(int quantity) {

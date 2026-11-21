@@ -11,6 +11,7 @@ public class Reservation {
     @Column(nullable = false, length = 64) private String sku;
     @Column(nullable = false) private int quantity;
     @Column(nullable = false) private boolean released;
+    @Version @Column(nullable = false) private long version;
 
     public String getSku() { return sku; }
     public int getQuantity() { return quantity; }

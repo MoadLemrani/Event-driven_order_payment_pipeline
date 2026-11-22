@@ -26,12 +26,14 @@ public class OrderController {
             @Pattern(regexp = "[A-Za-z0-9._-]{1,100}") String correlationId) {
         var order = workflow.create(request, correlationId);
         return ResponseEntity.created(URI.create("/orders/" + order.id()))
-            .header("X-Correlation-ID", order.correlationId()).body(order);
+            .body(order);
     }
 
     @GetMapping("/{id}")
-    public ResponseEntity<OrderResponse> get(@PathVariable UUID id) {
+    public ResponseEntity<OrderResponse> get(@PathVariable UUID id, jakarta.servlet.http.HttpServletResponse response) {
         var order = orders.get(id);
-        return ResponseEntity.ok().header("X-Correlation-ID", order.correlationId()).body(order);
+        org.slf4j.MDC.put("correlationId", order.correlationId());
+        response.setHeader("X-Correlation-ID", order.correlationId());
+        return ResponseEntity.ok().body(order);
     }
 }

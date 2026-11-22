@@ -42,6 +42,8 @@ public class OutboxPublisher {
                 kafka.send(event.destination(), event.messageKey(), event.envelope()).get(15, TimeUnit.SECONDS);
                 jdbc.update("UPDATE inventory_service.outbox_events SET sent_at = CURRENT_TIMESTAMP WHERE id = ?",
                     event.id());
+                org.slf4j.LoggerFactory.getLogger(OutboxPublisher.class)
+                    .info("Kafka acknowledged outbox publication {} to {}", event.id(), event.destination());
             } catch (InterruptedException ex) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Outbox publication interrupted", ex);

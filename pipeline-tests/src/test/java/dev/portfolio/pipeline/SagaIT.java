@@ -71,7 +71,8 @@ class SagaIT {
 
     private static URI awaitReady(RunningService service) {
         var result = new java.util.concurrent.atomic.AtomicReference<URI>();
-        await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofMillis(300)).untilAsserted(() -> {
+        await().atMost(Duration.ofSeconds(120)).pollInterval(Duration.ofMillis(300))
+            .ignoreExceptionsMatching(ex -> ex instanceof java.io.IOException).untilAsserted(() -> {
             assertThat(service.process().isAlive()).withFailMessage(() -> readLog(service)).isTrue();
             var matcher = Pattern.compile("Tomcat started on port (\\d+)").matcher(readLog(service));
             assertThat(matcher.find()).withFailMessage(() -> readLog(service)).isTrue();
@@ -149,7 +150,7 @@ class SagaIT {
         if (requestedTrace != null) {
             assertThat(trace).isEqualTo(requestedTrace);
         }
-        assertThat(response.headers().firstValue("X-Correlation-ID")).contains(trace);
+        assertThat(response.headers().allValues("X-Correlation-ID")).containsExactly(trace);
         assertThat(response.headers().firstValue("Location")).contains("/orders/" + id);
         assertThat(created.path("status").asText()).isEqualTo("CREATED");
         assertThat(created.path("currency").asText()).isEqualTo("USD");
@@ -157,7 +158,7 @@ class SagaIT {
         await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> {
             var result = get(orderUrl.resolve("/orders/" + id));
             assertThat(result.statusCode()).isEqualTo(200);
-            assertThat(result.headers().firstValue("X-Correlation-ID")).contains(trace);
+            assertThat(result.headers().allValues("X-Correlation-ID")).containsExactly(trace);
             assertThat(JSON.readTree(result.body()).path("status").asText()).isEqualTo("CONFIRMED");
         });
 
@@ -179,6 +180,24 @@ class SagaIT {
             + id + "' AND quantity = 2 AND sku = 'DEMO-SKU'")).isEqualTo(1);
         assertThat(count(PAYMENT_DB, "SELECT count(*) FROM payment_service.payments WHERE order_id = '"
             + id + "' AND total_amount = 19.98 AND status = 'SUCCEEDED'")).isEqualTo(1);
+        assertThat(metric(orderUrl, "pipeline_orders_total", "outcome=\"created\"")).isEqualTo(count(ORDER_DB, "SELECT count(*) FROM order_service.orders"));
+        assertThat(metric(orderUrl, "pipeline_orders_total", "outcome=\"confirmed\"")).isEqualTo(count(ORDER_DB, "SELECT count(*) FROM order_service.orders WHERE status = 'CONFIRMED'"));
+        assertThat(metric(orderUrl, "pipeline_orders_total", "outcome=\"cancelled\"")).isEqualTo(count(ORDER_DB, "SELECT count(*) FROM order_service.orders WHERE status = 'CANCELLED'"));
+        for (var running : SERVICES) {
+            URI base = awaitReady(running);
+            assertThat(metric(base, "spring_kafka_listener_seconds_count")).isGreaterThan(0);
+            boolean correlated = false;
+            for (String line : readLog(running).split("\\R")) {
+                if (!line.startsWith("{")) continue;
+                var log = JSON.readTree(line);
+                if (trace.equals(log.path("correlationId").asText()) && log.path("message").asText().startsWith("Handled ")) {
+                    assertThat(log.path("service").asText()).isEqualTo(running.name() + "-service");
+                    correlated = true;
+                }
+            }
+            assertThat(correlated).as("Correlated JSON consumer log from " + running.name()).isTrue();
+        }
+
     }
 
     @ParameterizedTest
@@ -197,6 +216,7 @@ class SagaIT {
             .header("Content-Type", "application/json").timeout(Duration.ofSeconds(5))
             .POST(HttpRequest.BodyPublishers.ofString(body)).build(), HttpResponse.BodyHandlers.ofString());
         assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(response.headers().firstValue("X-Correlation-ID")).isPresent();
         assertThat(JSON.readTree(response.body()).path("status").asInt()).isEqualTo(400);
         assertThat(count(ORDER_DB, "SELECT count(*) FROM order_service.orders")).isEqualTo(before);
     }
@@ -653,6 +673,67 @@ class SagaIT {
             var group = admin.describeConsumerGroups(List.of("inventory-service")).all().get(10, TimeUnit.SECONDS);
             assertThat(group.get("inventory-service").members()).hasSize(3);
         }
+    }
+
+    @Test
+    void committedOffsetLagRisesDuringBlockedProcessingAndReturnsToZero() throws Exception {
+        var inventory = SERVICES.stream().filter(s -> s.name().equals("inventory")).findFirst().orElseThrow();
+        URI base = awaitReady(inventory);
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+            assertThat(metric(base, "pipeline_consumer_lag")).isZero());
+        String id;
+        try (var connection = DriverManager.getConnection(INVENTORY_DB.getJdbcUrl(), INVENTORY_DB.getUsername(), INVENTORY_DB.getPassword())) {
+            connection.setAutoCommit(false);
+            try (var statement = connection.createStatement()) {
+                statement.execute("LOCK TABLE inventory_service.stock IN ACCESS EXCLUSIVE MODE");
+            }
+            id = createOrder("DEMO-SKU", 1, "lag-" + UUID.randomUUID());
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                assertThat(metric(base, "pipeline_consumer_lag")).isGreaterThanOrEqualTo(1);
+                assertThat(metric(base, "pipeline_consumer_lag_last_success_seconds")).isGreaterThan(0);
+            });
+            connection.rollback();
+        }
+        awaitStatus(id, "CONFIRMED");
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+            assertThat(metric(base, "pipeline_consumer_lag")).isZero());
+    }
+
+    @Test
+    void correlationHeadersCoverErrorsAndDoNotLeakBetweenRequests() throws Exception {
+        for (var running : SERVICES) {
+            URI base = awaitReady(running);
+            String trace = "http-error-" + UUID.randomUUID();
+            var response = HTTP.send(HttpRequest.newBuilder(base.resolve("/dead-letters?after=-1"))
+                .header("X-Correlation-ID", trace).GET().build(), HttpResponse.BodyHandlers.ofString());
+            assertThat(response.statusCode()).isEqualTo(400);
+            assertThat(response.headers().firstValue("X-Correlation-ID")).contains(trace);
+            var next = get(base.resolve("/dead-letters"));
+            assertThat(next.statusCode()).isEqualTo(200);
+            assertThat(next.headers().firstValue("X-Correlation-ID")).isPresent().get().isNotEqualTo(trace);
+            assertThat(metric(base, "pipeline_dlq_pending")).isEqualTo(count(serviceDatabase(running.name()),
+                "SELECT count(*) FROM " + running.name() + "_service.dead_letters WHERE replay_requested_at IS NULL"));
+        }
+    }
+
+    private static double metric(URI base, String metric) throws Exception {
+        return metric(base, metric, null);
+    }
+
+    private static double metric(URI base, String metric, String requiredLabel) throws Exception {
+        var response = get(base.resolve("/actuator/prometheus"));
+        assertThat(response.statusCode()).isEqualTo(200);
+        var pattern = Pattern.compile("^" + Pattern.quote(metric) + "(?:\\{[^}]*})? ([^ \\n]+)", Pattern.MULTILINE);
+        var matcher = pattern.matcher(response.body());
+        double total = 0;
+        boolean found = false;
+        while (matcher.find()) {
+            if (requiredLabel != null && !matcher.group().contains(requiredLabel)) continue;
+            found = true;
+            total += Double.parseDouble(matcher.group(1));
+        }
+        assertThat(found).as(metric + " exists in Prometheus scrape").isTrue();
+        return total;
     }
 
     private static void execute(PostgreSQLContainer<?> db, String sql) throws Exception {

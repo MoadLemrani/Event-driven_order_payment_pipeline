@@ -1,4 +1,10 @@
 spring:
+  main:
+    banner-mode: "off"
+  task:
+    scheduling:
+      pool:
+        size: 2
   application:
     name: payment-service
   datasource:
@@ -31,11 +37,25 @@ spring:
       ack-mode: record
 server:
   port: ${SERVER_PORT:8083}
+logging:
+  structured:
+    format:
+      console: logstash
+    json:
+      customizer: dev.portfolio.payment.observability.CorrelationLogCustomizer
+      add:
+        service: ${spring.application.name}
 management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        spring.kafka.listener: true
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
   endpoint:
     health:
       probes:

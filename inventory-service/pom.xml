@@ -9,6 +9,10 @@
   <artifactId>inventory-service</artifactId>
   <dependencies>
     <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+    <dependency>
       <groupId>dev.portfolio</groupId>
       <artifactId>common-events</artifactId>
       <version>${project.version}</version>

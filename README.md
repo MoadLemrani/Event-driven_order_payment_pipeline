@@ -1,6 +1,6 @@
 # Event-driven order/payment pipeline
 
-A Java backend portfolio project built in nine reviewable phases. **Current phase: 6 — optimistic locking and concurrent inventory safety.**
+A Java backend portfolio project built in nine reviewable phases. **Current phase: 7 — metrics, Grafana, and correlated JSON logs.**
 Orders coordinate through Kafka: confirm successful orders, cancel inventory rejections, and release reserved stock when mock payments fail.
 
 ## Modules
@@ -168,6 +168,33 @@ The inventory business listener runs three consumer threads for the three topic 
 
 Two deterministic PostgreSQL integration cases force transactions to load the same version before reserving or releasing. They assert that exactly one commits, the loser's claim/outbox/business changes roll back, and retry neither oversells nor restores stock twice. The packaged-service test submits **30 concurrent HTTP orders for seven units** through the real Kafka consumers and checks seven confirmations/payments, 23 shortage cancellations, zero remaining stock, seven reserved units, and no dead letters. This demonstrates correctness under contention, not a throughput benchmark.
 
+## Observability (Phase 7)
+
+`docker compose up --build -d` also starts Prometheus at http://localhost:9090 and Grafana at http://localhost:3000. Sign in to Grafana with `admin` / `portfolio_local` (override `GRAFANA_ADMIN_PASSWORD` before first startup). The **Order pipeline / Order pipeline reliability** dashboard and Prometheus data source are provisioned from `monitoring/`. No manual dashboard import is needed. Prometheus scrapes all three services every five seconds and retains seven days of samples; both monitoring services use persistent named volumes.
+
+Each service exposes `/actuator/prometheus`. The dashboard uses these metrics:
+
+| Metric | Meaning |
+| --- | --- |
+| `pipeline_orders_total` with `outcome` = `created`, `confirmed`, or `cancelled` | Counts from committed order rows. Created counts every order; confirmed/cancelled are terminal subsets. Terminal states do not reverse, so these counters survive service restarts and do not count rolled-back attempts. Deleting/resetting database data resets their history. |
+| `pipeline_consumer_lag{group=...}` | Sum of latest offsets minus committed group offsets across the group's business/replay or DLQ partitions. Missing offsets use the earliest retained offsets. Includes records fetched but not yet committed. |
+| `pipeline_consumer_lag_last_success_seconds` | Last successful lag snapshot's Unix timestamp; the dashboard shows its age. A broker outage retains the prior snapshot rather than reporting a false zero. Initially lag is NaN and the timestamp is zero. |
+| `pipeline_dlq_pending` | Persisted dead letters without a replay request. Replaying removes a row from this count; another failure creates a new pending entry. It is not the number of records retained in the Kafka DLT. |
+| `pipeline_outbox_pending` | Durable publications not yet marked sent. |
+| `spring_kafka_listener_seconds_*` | Spring Kafka listener attempt timing, including transaction completion, with histogram buckets for p95. Retries count as separate attempts; this is not end-to-end saga latency. |
+
+Metrics use bounded labels such as application, consumer group, and listener name; order IDs and correlation IDs belong in logs, never metric labels. Database-backed totals are appropriate for this small demo but require scans during scrapes. With multiple replicas, take `max` rather than summing replicated database totals. Lag is sampled on a separate scheduler thread so broker queries do not block outbox polling. Kafka administration calls have bounded timeouts; the snapshot age and scrape-health panels expose stale or unavailable data.
+
+Spring Boot emits one JSON object per log line with service, level, message, and `correlationId`. Startup and other context-free logs use `-`. HTTP requests accept a safe `X-Correlation-ID` or generate one, return it on success and validation/not-found responses, and clear MDC after processing. Successful order lookups return the stored saga trace. Consumers and outbox publications use the event's original trace; retry warnings retain it. Malformed envelopes without a usable trace cannot be associated with a saga.
+
+```sh
+curl -s http://localhost:8081/actuator/prometheus
+curl -i -H 'X-Correlation-ID: demo-observability' http://localhost:8081/orders/not-a-uuid
+docker compose logs --no-log-prefix order-service inventory-service payment-service
+```
+
+Integration tests check committed order totals, actual Prometheus listener timers, correlated JSON logs from all services, error-response headers, and pending-DLQ counts. Another test blocks inventory processing in PostgreSQL, observes committed-offset lag rise, then releases the lock and verifies lag returns to zero. Monitoring endpoints and Grafana are local demo surfaces, bound to loopback; the project does not add tracing collectors or a log storage service.
+
 ## Build and test
 
 Use JDK 21 and Maven 3.6.3+ with a running Docker-compatible runtime:
@@ -210,7 +237,7 @@ JUnit stops test containers on normal completion; interrupted Podman runs may ne
 - The reliability adapters remain local to each of the three services; `common-events` stays limited to contracts. A shared runtime library is deferred until further changes justify that abstraction.
 - Inventory shortages and mock payment declines are business outcomes, so they emit failure events rather than throwing infrastructure errors. Database and broker faults still surface as technical errors. Technical consumer failures use bounded retries and DLQ recovery; inventory conflicts roll back and use the same bounded retry policy.
 - On a payment failure, inventory emits `InventoryReleased` after its release transaction, and order-service then records cancellation. Release marks the existing reservation and restores stock in one database transaction. Its released flag prevents sequential repeated releases from adding stock again, and the processed-event table now prevents repeated incoming events from running the transaction again. Version checks now protect concurrent stock changes and reservation releases. Terminal order states cannot change from confirmed to cancelled or vice versa.
-- Correlation IDs are carried in the envelope and successful order HTTP responses. Listener processing uses MDC; full HTTP MDC coverage, error-response correlation, and structured logging remain later observability work.
+- Correlation IDs propagate through envelopes, HTTP headers, consumer/outbox MDC scopes, and JSON logs. Context-free logs use a sentinel; metrics deliberately omit per-order labels.
 
 ## Roadmap
 

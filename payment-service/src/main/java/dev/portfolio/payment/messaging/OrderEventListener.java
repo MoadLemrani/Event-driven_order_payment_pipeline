@@ -29,12 +29,15 @@ public class OrderEventListener {
         if (!OrderEvents.INVENTORY_RESERVED.equals(event.eventType())) {
             return;
         }
-        if (event.version() != 1) {
-            throw new IllegalArgumentException("Unsupported event version " + event.version());
-        }
         try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
-            service.handle(event);
-            log.info("Handled {} for order {}", event.eventType(), event.payload().orderId());
+            try {
+                if (event.version() != 1) throw new IllegalArgumentException("Unsupported event version " + event.version());
+                service.handle(event);
+                log.info("Handled {} for order {}", event.eventType(), event.payload().orderId());
+            } catch (RuntimeException ex) {
+                log.warn("Event {} failed for order {}", event.eventId(), event.payload().orderId(), ex);
+                throw ex;
+            }
         }
     }
 }

@@ -3,7 +3,6 @@ package dev.portfolio.order.application;
 import dev.portfolio.order.api.CreateOrderRequest;
 import dev.portfolio.order.api.OrderResponse;
 import org.springframework.stereotype.Service;
-import java.util.UUID;
 
 @Service
 public class OrderWorkflow {
@@ -14,7 +13,7 @@ public class OrderWorkflow {
     }
 
     public OrderResponse create(CreateOrderRequest request, String correlationId) {
-        String trace = correlationId == null ? UUID.randomUUID().toString() : correlationId;
+        String trace = correlationId == null ? org.slf4j.MDC.get("correlationId") : correlationId;
         return orders.create(request.sku(), request.quantity(), request.totalAmount(), trace);
     }
 }

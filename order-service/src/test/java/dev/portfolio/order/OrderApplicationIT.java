@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
+@org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class OrderApplicationIT {
@@ -64,6 +65,8 @@ class OrderApplicationIT {
         long id = jdbc.queryForObject("SELECT id FROM order_service.dead_letters WHERE record_offset = 9001", Long.class);
         assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.dead_letters WHERE record_offset = 9001", Long.class))
             .isEqualTo(1);
+        assertThat(http.getForEntity("/actuator/prometheus", String.class).getBody())
+            .containsPattern("(?m)^pipeline_dlq_pending\\{[^\\n]*} 1(?:\\.0)?$");
         jdbc.execute("ALTER TABLE order_service.dead_letters ADD CONSTRAINT test_replay_block CHECK (replay_requested_at IS NULL)");
         try {
             assertThatThrownBy(() -> deadLetters.replay(id)).isInstanceOf(RuntimeException.class);
@@ -74,6 +77,8 @@ class OrderApplicationIT {
         }
         deadLetters.replay(id);
         deadLetters.replay(id);
+        assertThat(http.getForEntity("/actuator/prometheus", String.class).getBody())
+            .containsPattern("(?m)^pipeline_dlq_pending\\{[^\\n]*} 0(?:\\.0)?$");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM order_service.outbox_events WHERE message_key = 'test-replay' AND sent_at IS NULL", Long.class))
             .isEqualTo(1);
         assertThat(http.getForEntity("/dead-letters?after=-1", String.class).getStatusCode().value()).isEqualTo(400);

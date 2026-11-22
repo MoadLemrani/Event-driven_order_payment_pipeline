@@ -29,6 +29,12 @@ public class OrderController {
             .body(order);
     }
 
+    @GetMapping
+    public java.util.List<OrderResponse> recent() { return orders.recent(); }
+
+    @GetMapping("/{id}/timeline")
+    public java.util.List<OrderService.TimelineEvent> timeline(@PathVariable UUID id) { return orders.timeline(id); }
+
     @GetMapping("/{id}")
     public ResponseEntity<OrderResponse> get(@PathVariable UUID id, jakarta.servlet.http.HttpServletResponse response) {
         var order = orders.get(id);

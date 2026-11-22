@@ -141,6 +141,14 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+  dashboard:
+    build: ./dashboard
+    ports:
+      - "127.0.0.1:3001:80"
+    depends_on:
+      - order-service
+      - inventory-service
+      - payment-service
   prometheus:
     image: docker.io/prom/prometheus:v3.16.0
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]

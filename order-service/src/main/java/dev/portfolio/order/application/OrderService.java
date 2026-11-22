@@ -18,11 +18,13 @@ public class OrderService {
     private final OrderRepository orders;
     private final EventOutbox outbox;
     private final ProcessedEvents processed;
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
 
-    public OrderService(OrderRepository orders, EventOutbox outbox, ProcessedEvents processed) {
+    public OrderService(OrderRepository orders, EventOutbox outbox, ProcessedEvents processed, org.springframework.jdbc.core.JdbcTemplate jdbc) {
         this.orders = orders;
         this.outbox = outbox;
         this.processed = processed;
+        this.jdbc = jdbc;
     }
 
     @Transactional
@@ -41,6 +43,11 @@ public class OrderService {
             return;
         }
         var order = find(event.payload().orderId());
+        jdbc.update("""
+            INSERT INTO order_service.order_timeline (event_id, order_id, event_type, correlation_id, occurred_at)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING
+            """, event.eventId(), order.getId(), event.eventType(), event.correlationId(),
+            java.sql.Timestamp.from(event.occurredAt()));
         String outgoing;
         switch (event.eventType()) {
             case OrderEvents.PAYMENT_SUCCEEDED -> {
@@ -51,10 +58,29 @@ public class OrderService {
                 order.cancel();
                 outgoing = OrderEvents.CANCELLED;
             }
-            default -> throw new IllegalArgumentException("Unexpected event " + event.eventType());
+            default -> { return; }
         }
         outbox.append(outgoing, order.getCorrelationId(), order.data());
     }
+
+    @Transactional(readOnly = true)
+    public java.util.List<OrderResponse> recent() {
+        return orders.findAll(org.springframework.data.domain.PageRequest.of(0, 100,
+            org.springframework.data.domain.Sort.by(org.springframework.data.domain.Sort.Direction.DESC, "createdAt")))
+            .stream().map(OrderResponse::from).toList();
+    }
+
+    @Transactional(readOnly = true)
+    public java.util.List<TimelineEvent> timeline(UUID id) {
+        find(id);
+        return jdbc.query("""
+            SELECT event_id, event_type, correlation_id, occurred_at FROM order_service.order_timeline
+            WHERE order_id = ? ORDER BY recorded_at, event_id
+            """, (rs, n) -> new TimelineEvent(rs.getObject("event_id", UUID.class), rs.getString("event_type"),
+                rs.getString("correlation_id"), rs.getTimestamp("occurred_at").toInstant()), id);
+    }
+
+    public record TimelineEvent(UUID eventId, String eventType, String correlationId, java.time.Instant occurredAt) {}
 
     private Order find(UUID id) {
         return orders.findById(id).orElseThrow(() -> new OrderNotFoundException(id));

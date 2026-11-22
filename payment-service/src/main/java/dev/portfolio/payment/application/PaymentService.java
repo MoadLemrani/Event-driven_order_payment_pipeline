@@ -14,14 +14,14 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class PaymentService {
     private final PaymentRepository payments;
-    private final PaymentProperties properties;
+    private final PaymentControl control;
     private final EventOutbox outbox;
     private final ProcessedEvents processed;
 
-    public PaymentService(PaymentRepository payments, PaymentProperties properties,
+    public PaymentService(PaymentRepository payments, PaymentControl control,
                           EventOutbox outbox, ProcessedEvents processed) {
         this.payments = payments;
-        this.properties = properties;
+        this.control = control;
         this.outbox = outbox;
         this.processed = processed;
     }
@@ -35,7 +35,7 @@ public class PaymentService {
             throw new IllegalArgumentException("Unexpected event " + event.eventType());
         }
         boolean succeeded = ThreadLocalRandom.current().nextDouble()
-            >= properties.failureRate().doubleValue();
+            >= control.failureRate().doubleValue();
         payments.save(new Payment(event.payload(), succeeded));
         outbox.append(succeeded ? OrderEvents.PAYMENT_SUCCEEDED : OrderEvents.PAYMENT_FAILED,
             event.correlationId(), event.payload());

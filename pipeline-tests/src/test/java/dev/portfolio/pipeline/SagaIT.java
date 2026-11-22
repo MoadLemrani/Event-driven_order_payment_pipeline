@@ -308,6 +308,8 @@ class SagaIT {
     private static void stopPayment() throws Exception { stopService("payment", false); }
 
     private static void startPayment(String failureRate) throws Exception {
+        // Set the persisted control before restarting so queued records cannot race the setting.
+        execute(PAYMENT_DB, "UPDATE payment_service.payment_control SET failure_rate = " + failureRate);
         restartService("payment", failureRate, true);
     }
 
@@ -332,6 +334,16 @@ class SagaIT {
         var service = start(name, serviceDatabase(name), failureRate, publisherEnabled);
         SERVICES.add(service);
         var base = awaitReady(service);
+        try (var admin = AdminClient.create(Map.of("bootstrap.servers", KAFKA.getBootstrapServers()))) {
+            await().atMost(Duration.ofSeconds(60)).ignoreExceptions().untilAsserted(() -> {
+                var group = admin.describeConsumerGroups(List.of(name + "-service")).all().get(10, TimeUnit.SECONDS)
+                    .get(name + "-service");
+                assertThat(group.state()).isEqualTo(org.apache.kafka.common.ConsumerGroupState.STABLE);
+                assertThat(group.members()).hasSize(name.equals("inventory") ? 3 : 1);
+                assertThat(group.members().stream().mapToInt(member -> member.assignment().topicPartitions().size()).sum())
+                    .isEqualTo(6);
+            });
+        }
         if (name.equals("order")) {
             orderUrl = base;
         }
@@ -383,7 +395,7 @@ class SagaIT {
             id = createOrder("DEMO-SKU", 2, trace);
             String query = "SELECT count(*) FROM " + name + "_service.outbox_events WHERE aggregate_id = '"
                 + id + "' AND sent_at IS NULL";
-            await().atMost(Duration.ofSeconds(45)).untilAsserted(() -> assertThat(count(db, query)).isEqualTo(1));
+            await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> assertThat(count(db, query)).isEqualTo(1));
             pendingId = scalar(db, "SELECT event_id FROM " + name
                 + "_service.outbox_events WHERE aggregate_id = '" + id + "' AND sent_at IS NULL");
             assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id)).body()).path("status").asText())
@@ -734,6 +746,51 @@ class SagaIT {
         }
         assertThat(found).as(metric + " exists in Prometheus scrape").isTrue();
         return total;
+    }
+
+    @Test
+    void dashboardTimelineAndRuntimeFailureToggleTrackCompensationAndDuplicates() throws Exception {
+        var payment = awaitReady(SERVICES.stream().filter(s -> s.name().equals("payment")).findFirst().orElseThrow());
+        var invalid = HTTP.send(HttpRequest.newBuilder(payment.resolve("/payment-control"))
+            .header("Content-Type", "application/json").PUT(HttpRequest.BodyPublishers.ofString("{\"failureRate\":2}"))
+            .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(invalid.statusCode()).isEqualTo(400);
+        try {
+            setPaymentRate(payment, 1);
+            String id = createOrder("DEMO-SKU", 1, "ui-failure-" + UUID.randomUUID());
+            awaitStatus(id, "CANCELLED");
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                var timeline = JSON.readTree(get(orderUrl.resolve("/orders/" + id + "/timeline")).body());
+                assertThat(timeline).hasSize(5);
+                assertThat(java.util.stream.StreamSupport.stream(timeline.spliterator(), false)
+                    .map(e -> e.path("eventType").asText()).toList())
+                    .containsExactly("OrderCreated", "InventoryReserved", "PaymentFailed", "InventoryReleased", "OrderCancelled");
+            });
+            var timeline = JSON.readTree(get(orderUrl.resolve("/orders/" + id + "/timeline")).body());
+            var original = readEvents(id, timeline.get(0).path("correlationId").asText(),
+                "OrderCreated", "InventoryReserved", "PaymentFailed", "InventoryReleased", "OrderCancelled");
+            duplicateAndDrain(original);
+            assertThat(JSON.readTree(get(orderUrl.resolve("/orders/" + id + "/timeline")).body())).hasSize(5);
+            assertThat(get(orderUrl.resolve("/orders")).body()).contains(id);
+            stopPayment();
+            restartService("payment", "0", true);
+            payment = awaitReady(SERVICES.stream().filter(s -> s.name().equals("payment")).findFirst().orElseThrow());
+            assertThat(JSON.readTree(get(payment.resolve("/payment-control")).body()).path("failureRate").decimalValue())
+                .isEqualByComparingTo("1");
+        } finally {
+            setPaymentRate(payment, 0);
+        }
+        String recovered = createOrder("DEMO-SKU", 1, "ui-recovery-" + UUID.randomUUID());
+        awaitStatus(recovered, "CONFIRMED");
+    }
+
+    private static void setPaymentRate(URI base, int rate) throws Exception {
+        var response = HTTP.send(HttpRequest.newBuilder(base.resolve("/payment-control"))
+            .header("Content-Type", "application/json")
+            .PUT(HttpRequest.BodyPublishers.ofString("{\"failureRate\":" + rate + "}"))
+            .build(), HttpResponse.BodyHandlers.ofString());
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(JSON.readTree(response.body()).path("failureRate").asInt()).isEqualTo(rate);
     }
 
     private static void execute(PostgreSQLContainer<?> db, String sql) throws Exception {

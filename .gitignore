@@ -4,3 +4,7 @@
 .vscode/
 .env
 *.log
+
+dashboard/node_modules/
+dashboard/dist/
+*.tsbuildinfo

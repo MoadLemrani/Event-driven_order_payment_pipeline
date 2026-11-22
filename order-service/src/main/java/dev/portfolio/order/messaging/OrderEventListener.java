@@ -26,11 +26,6 @@ public class OrderEventListener {
     @KafkaListener(topics = {OrderEvents.TOPIC, KafkaConfiguration.REPLAY})
     public void onEvent(String message) throws JsonProcessingException {
         EventEnvelope<OrderData> event = json.readValue(message, EVENT_TYPE);
-        if (!OrderEvents.PAYMENT_SUCCEEDED.equals(event.eventType())
-                && !OrderEvents.INVENTORY_FAILED.equals(event.eventType())
-                && !OrderEvents.INVENTORY_RELEASED.equals(event.eventType())) {
-            return;
-        }
         try (var ignored = MDC.putCloseable("correlationId", event.correlationId())) {
             try {
                 if (event.version() != 1) throw new IllegalArgumentException("Unsupported event version " + event.version());

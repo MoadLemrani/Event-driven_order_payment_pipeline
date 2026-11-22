@@ -49,3 +49,5 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
       - run: npm run build
+      - name: Verify dashboard container serves its assets
+        run: ./smoke-test.sh

@@ -1,7 +1,8 @@
 # Event-driven order/payment pipeline
 
-A Java backend portfolio project built in nine reviewable phases. **Current phase: 8 — live order dashboard and recovery controls.**
-Orders coordinate through Kafka: confirm successful orders, cancel inventory rejections, and release reserved stock when mock payments fail.
+A small event-driven order and payment system built to demonstrate reliable Java backend patterns. Three services coordinate through Kafka: successful payments confirm orders, inventory shortages cancel them, and failed payments trigger a stock-release compensation before cancellation.
+
+The project emphasizes transactional outboxes, idempotent consumers, bounded retries and replay, optimistic locking, and observable failure behavior. Payments are simulated; this is a local portfolio demo, not a payment processor.
 
 ## Modules
 
@@ -11,7 +12,46 @@ Orders coordinate through Kafka: confirm successful orders, cancel inventory rej
 - `payment-service`: persistent mock payment outcomes with configurable failure injection.
 - `pipeline-tests`: test-only module that launches all three executable JARs with Kafka and isolated databases.
 
-Java 21, Spring Boot 3.5.14, Maven, Spring Kafka, PostgreSQL 17, and Flyway.
+Java 21, Spring Boot 3.5.14, Maven, Spring Kafka, PostgreSQL 17, Flyway, Testcontainers, Micrometer, Prometheus, Grafana, and React/TypeScript/Vite/Tailwind.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[React dashboard] -->|HTTP via nginx| O[order-service]
+    UI -->|HTTP via nginx| I[inventory-service]
+    UI -->|HTTP via nginx| P[payment-service]
+    O --- OD[(Order PostgreSQL)]
+    I --- ID[(Inventory PostgreSQL)]
+    P --- PD[(Payment PostgreSQL)]
+    O <-->|events| K[Kafka KRaft]
+    I <-->|events| K
+    P <-->|events| K
+    M[Prometheus] -->|scrape| O
+    M -->|scrape| I
+    M -->|scrape| P
+    G[Grafana] -->|query| M
+```
+
+Every service owns its database and writes outgoing messages to a local transactional outbox. Kafka transports events; consumers claim each event ID in the same database transaction as their work. Services expose isolated dead-letter topics and replay endpoints. The dashboard polls the order timeline and recovery APIs.
+
+### Event flow
+
+```mermaid
+flowchart TD
+    A[OrderCreated] --> B{Inventory}
+    B -->|stock available| C[InventoryReserved]
+    B -->|missing or insufficient stock| D[InventoryFailed]
+    D --> E[OrderCancelled]
+    C --> F{Mock payment}
+    F -->|success| G[PaymentSucceeded]
+    G --> H[OrderConfirmed]
+    F -->|failure| J[PaymentFailed]
+    J --> L[InventoryReleased]
+    L --> E
+```
+
+Events are keyed by order ID and share an envelope with `eventId`, `eventType`, `correlationId`, `occurredAt`, `version`, and `payload`. The order service records a deduplicated timeline from the stream; it cancels a payment-failed order only after the release is recorded. There is no notification service.
 
 ## Run locally
 
@@ -56,7 +96,7 @@ curl -i -X POST http://localhost:8081/orders \
 The API returns `201 Created`, a `Location: /orders/<id>` header, and a `CREATED` order snapshot after committing the order and its outgoing event to PostgreSQL. It does not wait for Kafka publication. Omit `X-Correlation-ID` to generate one. Poll the returned location:
 
 ```sh
-curl http://localhost:8081/orders/<id>
+curl "http://localhost:8081/orders/<id>"
 ```
 
 It becomes `CONFIRMED` after `OrderCreated → InventoryReserved → PaymentSucceeded → OrderConfirmed`.
@@ -156,6 +196,25 @@ curl -s http://localhost:8083/dead-letters
 curl -i -X POST http://localhost:8083/dead-letters/1/replay
 ```
 
+### Demo a technical failure and replay
+
+With payment failure rate set to `0`, add a temporary PostgreSQL constraint that rejects new successful payment rows. Existing rows are not checked by `NOT VALID`:
+
+```sh
+docker compose exec -T payment-db psql -U payment -d payment_db -c \
+  "ALTER TABLE payment_service.payments ADD CONSTRAINT demo_reject_payment CHECK (status <> 'SUCCEEDED') NOT VALID;"
+```
+
+Create a `DEMO-SKU` order using the happy-path request and save its ID. After the retries are exhausted, `GET http://localhost:8083/dead-letters` returns a pending entry whose `messageKey` is that order ID. Its order remains `CREATED` while payment is unresolved. Remove the constraint, then replay that entry by ID:
+
+```sh
+docker compose exec -T payment-db psql -U payment -d payment_db -c \
+  "ALTER TABLE payment_service.payments DROP CONSTRAINT demo_reject_payment;"
+curl -i -X POST "http://localhost:8083/dead-letters/<dead-letter-id>/replay"
+```
+
+Replace `<dead-letter-id>` with the numeric ID from the payment dead-letter response, and poll the order. It reaches `CONFIRMED` after replay. Remove the temporary constraint even if the demo is interrupted; the Docker volume retains database changes.
+
 The end-to-end tests demonstrate real database outages, four delivery attempts, dead-letter persistence, and recovery after repair for every service. Tests measure increasing retry delays, verify transient recovery without a DLQ entry, and prove that a DLQ storage outage cannot create a recursive publish loop. Replay enqueueing and its status marker roll back together. Malformed JSON is also quarantined, and a failed replay returns to the failed service's DLQ only. Mock payment declines are intentionally not technical failures, so the payment failure-rate switch does not populate this page.
 
 Operational trade-offs: DLQ handoff allows later records to progress, so replay can arrive out of order. This small saga's state guards and stable event IDs are the safety boundary; arbitrary historical reordering is not supported. Dead letters and replay outbox rows are retained without automatic pruning. APIs are unauthenticated for the local portfolio demo; protect operator endpoints before external deployment. Polling publication remains an indefinitely retried durable queue, distinct from the bounded consumer retry budget. Topic replication remains one for local development.
@@ -219,7 +278,7 @@ Each service test verifies Flyway startup, all three health endpoints, and broke
 `pipeline-tests` launches the actual packaged services as separate Java processes and verifies the happy-path sequence, persisted stock/reservation/payment effects, supplied/generated correlation IDs, validation, and 404 responses. It also tests unknown SKUs, shortages, and forced payment failures: it proves stock was reserved before payment, verifies all five compensation events, checks restored stock and terminal cancellation, then successfully reuses the stock. The tests exercise the runtime failure-control API and restore the default mode; the environment variable seeds a new database. Run the full reactor from the repository root so the service JARs are built first. Child processes stop after the suite; their diagnostic logs are in `pipeline-tests/target/service-logs/`.
 The suite also forcibly terminates each service after a business transaction commits but before its publisher runs, then proves restart recovers the original event ID. Duplicate events traverse the actual Kafka consumers; tests wait for all consumer groups to commit past those records before checking stock, payment, and outgoing-event counts. Compensation messages are replayed after switching payments from failure to success, proving a processed decision does not change. A database constraint that rejects sent-marker updates reproduces Kafka acknowledgement followed by database failure and proves safe redelivery of the identical envelope.
 
-The shared contract has validation tests. Runtime images run as an unprivileged user.
+The shared contract has validation tests. Java service images run as an unprivileged user.
 
 For rootless Podman on Linux, enable its API socket and set the following before Maven:
 
@@ -235,13 +294,13 @@ JUnit stops test containers on normal completion; interrupted Podman runs may ne
 
 ## Decisions and trade-offs
 
-- Separate PostgreSQL containers isolate service ownership at a small local resource cost. V1 creates each service namespace; V2 creates its business tables; V3 adds cancellation, failed payments, and release tracking; V4 adds outbox and processed-event tables; V5 adds dead-letter storage and outbox routing for replay. Earlier migrations are unchanged.
+- Separate PostgreSQL containers isolate service ownership at a small local resource cost. V1 creates each service namespace; V2 creates its business tables; V3 adds cancellation, failed payments, and release tracking; V4 adds outbox and processed-event tables; V5 adds dead-letter storage and outbox routing for replay. V6 adds inventory versions, the order timeline, or payment control in the relevant service. Earlier migrations are unchanged.
 - One Kafka broker/controller in KRaft mode keeps local startup simple. It provides no broker redundancy, uses plaintext locally, and needs no Zookeeper.
 - A single parameterized Dockerfile builds the small reactor in a shared layer, then selects each service JAR. This keeps build logic and dependency downloads reusable across images; host Java is unnecessary for Compose startup.
 - The shared module contains contracts only. Business behavior stays in its owning service.
 - Schema changes belong to Flyway; Hibernate is configured to validate, never create or update tables.
 - One SKU per order, a fixed USD currency, and a seeded `DEMO-SKU` with 100 units keep the example small. The caller supplies the total mock charge; this is not a pricing or real payment system.
-- All event types use the `order-events` topic with three partitions, keyed by order UUID. Each service has a separate consumer group and ignores unrelated event types. A shared order payload keeps this small contract explicit.
+- All event types use the `order-events` topic with three partitions, keyed by order UUID. Each service has a separate consumer group; inventory and payment ignore unrelated events, while order-service records them for its timeline. A shared order payload keeps this small contract explicit.
 - Business changes, processed-event claims, and outgoing events commit atomically in each service database. Publishers provide at-least-once delivery using stable event IDs; consumers deduplicate those IDs. Sent outbox rows and processed IDs are retained for now. Deleting deduplication history while old events can still be replayed would break this guarantee.
 - V4 does not backfill IDs for events processed before this phase or recover events lost before an outbox existed. Preserve existing consumer offsets during upgrades; do not replay pre-V4 history into databases containing old business effects.
 - The reliability adapters remain local to each of the three services; `common-events` stays limited to contracts. A shared runtime library is deferred until further changes justify that abstraction.
@@ -249,16 +308,22 @@ JUnit stops test containers on normal completion; interrupted Podman runs may ne
 - On a payment failure, inventory emits `InventoryReleased` after its release transaction, and order-service then records cancellation. Release marks the existing reservation and restores stock in one database transaction. Its released flag prevents sequential repeated releases from adding stock again, and the processed-event table now prevents repeated incoming events from running the transaction again. Version checks now protect concurrent stock changes and reservation releases. Terminal order states cannot change from confirmed to cancelled or vice versa.
 - Correlation IDs propagate through envelopes, HTTP headers, consumer/outbox MDC scopes, and JSON logs. Context-free logs use a sentinel; metrics deliberately omit per-order labels.
 
-## Roadmap
+## Continuous integration
 
-1. Skeleton, isolated databases, health checks, container-backed smoke tests.
-2. Happy-path saga and end-to-end integration test.
-3. Failure paths and inventory compensation.
-4. Transactional outbox and idempotent consumers with failure/duplicate tests.
-5. Exponential retries, dead-letter topics, replay API.
-6. Optimistic locking and concurrent stock tests.
-7. Metrics, Prometheus, Grafana, structured correlated logs.
-8. React/TypeScript dashboard, timeline, DLQ replay, payment failure toggle.
-9. GitHub Actions and full architecture/demo/trade-off documentation.
+Every push and pull request runs [CI](.github/workflows/ci.yml) on GitHub-hosted Ubuntu. The backend job uses Temurin 21 and runs `mvn -B -ntp clean verify`, including Kafka/PostgreSQL Testcontainers integration tests; it uploads reports and service logs on failure. The dashboard job uses Node 22, installs the committed lockfile with `npm ci`, and runs the TypeScript/Vite production build. Both jobs must pass. Docker is required for the backend tests; a missing container runtime fails the tests rather than skipping them. To run the same checks locally:
 
-Each phase is built, tested, and committed before the next starts.
+```sh
+mvn -B -ntp clean verify
+npm ci --prefix dashboard
+npm run build --prefix dashboard
+```
+
+GitHub Actions validates the build and tests; it does not deploy the application or exercise the complete Compose stack in a browser.
+
+## What I'd do next
+
+- Add authentication and authorization for payment controls, replay APIs, and monitoring; use proper secrets and encrypted transport outside a local demo.
+- Add an HTTP idempotency key for order creation and a documented retention policy for outbox and processed-event records that respects the replay window.
+- Add distributed tracing and end-to-end saga latency, production alerts, and more efficient lag/DB metrics for multi-instance deployments.
+- Exercise broker outages, service restarts, and the dashboard in automated Compose/browser smoke tests; add alerts and operational runbooks for stale sagas and replay failures.
+- Revisit polling-batch head-of-line blocking, out-of-order replay, data retention, and broker/database availability before increasing throughput or running multiple nodes.
